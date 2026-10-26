@@ -1,0 +1,31 @@
+# Файл сборки для GitHub Actions (только Windows).
+# В репозитории он должен лежать по пути .github/workflows/build.yml (см. README: «Как собрать VST3»).
+# Папка .github при загрузке через браузер пропадает, поэтому файл создаётся/обновляется вручную в редакторе GitHub.
+
+name: Build VST3 (Windows)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release --target TabMidi_VST3 TabMidi_Standalone --parallel
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabMidi-VST3-Windows
+          path: build/TabMidi_artefacts/Release/VST3
+      - name: Upload standalone app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabMidi-Standalone-Windows
+          path: build/TabMidi_artefacts/Release/Standalone
