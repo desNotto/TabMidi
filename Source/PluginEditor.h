@@ -53,7 +53,10 @@ struct TabLnF : LookAndFeel_V4
 
 //==============================================================================
 /** The tab staff: grid of 16th-note cells, one row per string (highest string on top).
-    Click a bar number to select the whole bar (Shift = range): Delete / Ctrl+C / Ctrl+X / Ctrl+V work on it. Ctrl+Z undoes. */
+    The grid follows the selected note length: with a whole note you can only write at the start of a bar,
+    with a half note at the start or the middle, and so on, so a note never crosses a bar line.
+    Select cells by dragging (or Shift+click / Shift+arrows), a bar by clicking its number, a bar by double click.
+    Delete, Ctrl+C, Ctrl+X, Ctrl+V work on the selection, Ctrl+Z undoes. */
 class TabCanvas : public Component
 {
 public:
@@ -66,12 +69,12 @@ public:
     std::function<void()> onStructure;               // bar count may have changed (undo)
     std::function<void (const String&)> onInfo;      // short status message
     int selCell = 0, selStr = 0;
-    float cellW = 14.7f;                             // 4 bars exactly fill the window; longer scores scroll
+    float cellW = 14.7f;                             // 4 bars exactly fill the window by default
 
     static float rowSp (int n) { return n <= 6 ? 18.0f : n == 7 ? 17.0f : n == 8 ? 15.0f : 14.0f; }
 
-    bool hasBarSelection() const { return barA >= 0; }
-    bool hasClipboard() const    { return ! clipBars.empty(); }
+    bool hasBarSelection() const { return rangeA >= 0; }
+    bool hasClipboard() const    { return ! clipCells.empty(); }
     bool canUndo() const         { return ! undoStack.empty(); }
 
     void refreshSize()
@@ -80,7 +83,7 @@ public:
         const int n = proc.score.numStrings, total = proc.score.totalCells();
         selCell = jlimit (0, jmax (0, total - 1), selCell);
         selStr = jlimit (0, n - 1, selStr);
-        if (barA >= proc.score.numBars() || barB >= proc.score.numBars()) barA = barB = -1;
+        if (rangeB >= total) rangeA = rangeB = -1;
         float viewW = 990.0f;
         if (auto* v = findParentComponentOfClass<Viewport>()) viewW = (float) v->getMaximumVisibleWidth();
         const int shown = jmin (proc.viewBars, proc.score.numBars());          // bars visible at once
@@ -97,32 +100,58 @@ public:
             const ScopedLock sl (proc.lock);
             selCell = jlimit (0, jmax (0, proc.score.totalCells() - 1), cell);
             selStr = jlimit (0, proc.score.numStrings - 1, str);
-            barA = barB = -1;
+            anchor = selCell;
+            rangeA = rangeB = -1;
         }
         ensureVisible();
         repaint();
         if (onSelection) onSelection();
     }
 
+    /** Selects whole bars. With extend the range grows from the bar that was selected first. */
     void selectBar (int bar, bool extend)
     {
         {
             const ScopedLock sl (proc.lock);
             bar = jlimit (0, proc.score.numBars() - 1, bar);
-            if (extend && barA >= 0) barB = bar; else barA = barB = bar;
-            selCell = proc.score.barStart (jmin (barA, barB));
+            if (extend && rangeA >= 0)
+            {
+                const int b0 = jmin (proc.score.barOfCell (anchor), bar), b1 = jmax (proc.score.barOfCell (anchor), bar);
+                rangeA = proc.score.barStart (b0);
+                rangeB = proc.score.barStart (b1) + barLen (b1) - 1;
+            }
+            else
+            {
+                rangeA = proc.score.barStart (bar);
+                rangeB = rangeA + barLen (bar) - 1;
+                anchor = rangeA;
+            }
+            selCell = rangeA;
         }
         ensureVisible();
         repaint();
         if (onSelection) onSelection();
     }
 
-    /** (string, fret) of every note in the selected column. */
+    /** After the note length changed: an empty cursor jumps to the nearest slot of the new grid. */
+    void snapSelectionToGrid()
+    {
+        if (selectedLength() > 0) return;
+        {
+            const ScopedLock sl (proc.lock);
+            selCell = snapStart (selCell);
+            anchor = selCell;
+        }
+        repaint();
+        if (onSelection) onSelection();
+    }
+
+    /** (string, fret) of every note in the selected column; nothing while a range is selected. */
     std::vector<std::pair<int, int>> selectedNotes() const
     {
         const ScopedLock sl (proc.lock);
         std::vector<std::pair<int, int>> r;
-        if (barA < 0 && selCell < proc.score.totalCells())
+        if (rangeA < 0 && selCell < proc.score.totalCells())
             for (int s = 0; s < proc.score.numStrings; ++s)
                 if (proc.score.cells[(size_t) selCell].fret[s] >= 0)
                     r.push_back ({ s, proc.score.cells[(size_t) selCell].fret[s] });
@@ -148,7 +177,7 @@ public:
         if (undoStack.size() > 40) undoStack.erase (undoStack.begin());
     }
 
-    void clearHistory() { undoStack.clear(); barA = barB = -1; }
+    void clearHistory() { undoStack.clear(); rangeA = rangeB = -1; }
 
     void undo()
     {
@@ -159,7 +188,7 @@ public:
             proc.score.barCells = undoStack.back().barCells;
             undoStack.pop_back();
             proc.markEdited();
-            barA = barB = -1;
+            rangeA = rangeB = -1;
         }
         refreshSize();
         repaint();
@@ -177,14 +206,14 @@ public:
             auto& c = proc.score.cells[(size_t) selCell];
             if (c.fret[str] < 0)
             {
-                int len = proc.duration;                       // a new note in a chord joins the chord's length
+                int len = newNoteLen (selCell);               // a note never runs over the bar line
                 for (int s = 0; s < proc.score.numStrings; ++s)
-                    if (s != str && c.fret[s] >= 0) { len = c.len[s]; break; }
-                c.len[str] = len;
+                    if (s != str && c.fret[s] >= 0) { len = jmin (c.len[s], barEndExclusive (selCell) - selCell); break; }   // joins the chord
+                c.len[str] = jmax (1, len);
             }
             c.fret[str] = fret;
             selStr = str;
-            barA = barB = -1;
+            rangeA = rangeB = -1;
             proc.markEdited();
         }
         edited();
@@ -200,7 +229,7 @@ public:
         {
             const ScopedLock sl (proc.lock);
             proc.score.cells[(size_t) selCell].fret[str] = -1;
-            barA = barB = -1;
+            rangeA = rangeB = -1;
             proc.markEdited();
         }
         edited();
@@ -220,13 +249,14 @@ public:
     /** Sets the length of every note in the selected column (like a beat in Guitar Pro). */
     void applyDurationToSelection()
     {
-        if (selectedLength() == 0) return;
+        if (selectedLength() == 0) { snapSelectionToGrid(); return; }
         pushUndo();
         {
             const ScopedLock sl (proc.lock);
             auto& c = proc.score.cells[(size_t) selCell];
+            const int room = barEndExclusive (selCell) - selCell;
             for (int s = 0; s < proc.score.numStrings; ++s)
-                if (c.fret[s] >= 0) c.len[s] = proc.duration;
+                if (c.fret[s] >= 0) c.len[s] = jmax (1, jmin (proc.duration, room));
             proc.markEdited();
         }
         edited();
@@ -235,72 +265,58 @@ public:
     //==========================================================================
     bool copyBars()
     {
-        int n;
+        int n, bars;
         {
             const ScopedLock sl (proc.lock);
-            if (barA < 0) return false;
-            clipCells.clear(); clipBars.clear();
-            for (int b = jmin (barA, barB); b <= jmax (barA, barB); ++b)
-            {
-                const int st = proc.score.barStart (b), cnt = proc.score.barCells[(size_t) b];
-                clipBars.push_back (cnt);
-                clipCells.insert (clipCells.end(), proc.score.cells.begin() + st, proc.score.cells.begin() + st + cnt);
-            }
-            n = (int) clipBars.size();
+            if (rangeA < 0) return false;
+            clipCells.assign (proc.score.cells.begin() + rangeA, proc.score.cells.begin() + rangeB + 1);
+            clipBarCount = alignedBars (rangeA, rangeB);
+            n = (int) clipCells.size();
+            bars = clipBarCount;
         }
         if (onSelection) onSelection();
-        info ("Скопировано тактов: "_ru + String (n));
+        info (bars > 0 ? "Скопировано тактов: "_ru + String (bars) : "Скопировано ячеек: "_ru + String (n));
         return true;
     }
 
     void deleteBars()
     {
-        if (barA < 0) return;
+        if (rangeA < 0) return;
         pushUndo();
-        int n;
+        int bars, n;
         {
             const ScopedLock sl (proc.lock);
-            for (int b = jmin (barA, barB); b <= jmax (barA, barB); ++b)
-            {
-                const int st = proc.score.barStart (b);
-                for (int j = 0; j < proc.score.barCells[(size_t) b]; ++j) proc.score.cells[(size_t) (st + j)] = Cell();
-            }
-            n = jmax (barA, barB) - jmin (barA, barB) + 1;
+            for (int c = rangeA; c <= rangeB; ++c) proc.score.cells[(size_t) c] = Cell();
+            bars = alignedBars (rangeA, rangeB);
+            n = rangeB - rangeA + 1;
             proc.markEdited();
         }
         edited();
-        info ("Очищено тактов: "_ru + String (n));
+        info (bars > 0 ? "Очищено тактов: "_ru + String (bars) : "Очищено ячеек: "_ru + String (n));
     }
 
     void pasteBars()
     {
-        if (clipBars.empty()) return;
+        if (clipCells.empty()) return;
         pushUndo();
-        int pasted = 0;
+        int pasted = 0, bars = 0;
         {
             const ScopedLock sl (proc.lock);
-            const int first = barA >= 0 ? jmin (barA, barB) : proc.score.barOfCell (selCell);
-            size_t src = 0;
-            for (size_t i = 0; i < clipBars.size(); ++i)
+            const int p0 = rangeA >= 0 ? rangeA : selCell;
+            for (size_t j = 0; j < clipCells.size() && p0 + (int) j < proc.score.totalCells(); ++j)
             {
-                const int b = first + (int) i;
-                const int sn = clipBars[i];
-                if (b < proc.score.numBars())
-                {
-                    const int dst = proc.score.barStart (b), dn = proc.score.barCells[(size_t) b];
-                    for (int j = 0; j < dn; ++j)
-                        proc.score.cells[(size_t) (dst + j)] = j < sn ? clipCells[src + (size_t) j] : Cell();
-                    ++pasted;
-                }
-                src += (size_t) sn;
+                proc.score.cells[(size_t) p0 + j] = clipCells[j];
+                ++pasted;
             }
-            barA = first; barB = first + jmax (0, pasted - 1);
-            selCell = proc.score.barStart (first);
+            rangeA = anchor = selCell = p0;
+            rangeB = p0 + pasted - 1;
+            bars = pasted == (int) clipCells.size() ? alignedBars (rangeA, rangeB) : 0;
             proc.markEdited();
         }
         edited();
-        info (pasted == (int) clipBars.size() ? "Вставлено тактов: "_ru + String (pasted)
-                                              : "Вставлено тактов: "_ru + String (pasted) + " из " + String ((int) clipBars.size()) + " (дальше нет места)"_ru);
+        String msg = bars > 0 ? "Вставлено тактов: "_ru + String (bars) : "Вставлено ячеек: "_ru + String (pasted);
+        if (pasted < (int) clipCells.size()) msg << " (дальше нет места)"_ru;
+        info (msg);
     }
 
     //==========================================================================
@@ -313,12 +329,10 @@ public:
         auto rowY = [&] (int s) { return top + (float) (n - 1 - s) * sp; };
         const float yTop = top, yBot = rowY (0), xEnd = x0 + (float) sc.totalCells() * cellW;
 
-        // selected bars
-        if (barA >= 0)
+        // selection: a range of cells, or the cursor (as wide as the note that would be written there)
+        if (rangeA >= 0)
         {
-            const int lo = jmin (barA, barB), hi = jmax (barA, barB);
-            const float xa = x0 + (float) sc.barStart (lo) * cellW;
-            const float xb = x0 + (float) (sc.barStart (hi) + sc.barCells[(size_t) hi]) * cellW;
+            const float xa = x0 + (float) rangeA * cellW, xb = x0 + (float) (rangeB + 1) * cellW;
             g.setColour (col::accent.withAlpha (0.10f));
             g.fillRoundedRectangle (xa, 1.0f, xb - xa, yBot + 12.0f, 5.0f);
             g.setColour (col::accent.withAlpha (0.6f));
@@ -326,36 +340,49 @@ public:
         }
         else
         {
+            int curLen = 0;
+            for (int s = 0; s < n && curLen == 0; ++s)
+                if (selCell < sc.totalCells() && sc.cells[(size_t) selCell].fret[s] >= 0) curLen = sc.cells[(size_t) selCell].len[s];
+            if (curLen == 0) curLen = newNoteLen (selCell);
+            curLen = jmax (1, jmin (curLen, sc.totalCells() - selCell));
+            const float cw = (float) curLen * cellW;
             g.setColour (col::accent.withAlpha (0.12f));
-            g.fillRoundedRectangle (x0 + (float) selCell * cellW + 1.0f, yTop - 9.0f, jmax (2.0f, cellW - 2.0f), yBot - yTop + 18.0f, 4.0f);
+            g.fillRoundedRectangle (x0 + (float) selCell * cellW + 1.0f, yTop - 9.0f, jmax (2.0f, cw - 2.0f), yBot - yTop + 18.0f, 4.0f);
             g.setColour (col::accent);
-            g.drawRoundedRectangle (x0 + (float) selCell * cellW + 1.5f, rowY (selStr) - sp * 0.5f, jmax (1.5f, cellW - 3.0f), sp, 3.0f, 1.2f);
+            g.drawRoundedRectangle (x0 + (float) selCell * cellW + 1.5f, rowY (selStr) - sp * 0.5f, jmax (1.5f, cw - 3.0f), sp, 3.0f, 1.2f);
         }
 
         // strings
         g.setColour (col::strLine.withAlpha (0.55f));
         for (int s = 0; s < n; ++s) g.drawHorizontalLine (roundToInt (rowY (s)), x0, xEnd);
 
-        // bars and beats
+        // bars and the grid of the selected note length
         int c = 0;
         for (int b = 0; b < sc.numBars(); ++b)
         {
             const float x = x0 + (float) c * cellW;
-            for (int k = 4; k < sc.barCells[(size_t) b]; k += 4)
+            const int step = stepIn (b), bn = sc.barCells[(size_t) b];
+            if (step < 4 && cellW * (float) step >= 3.5f)                                   // fine grid for 1/16 and 1/8
+                for (int k = step; k < bn; k += step)
+                {
+                    g.setColour (col::line.withAlpha (0.5f));
+                    g.drawVerticalLine (roundToInt (x + (float) k * cellW), yTop - 2.0f, yBot + 2.0f);
+                }
+            for (int k = jmax (step, 4); k < bn; k += jmax (step, 4))                       // beats, or the slots of a long note
             {
                 g.setColour (col::line);
                 g.drawVerticalLine (roundToInt (x + (float) k * cellW), yTop - 4.0f, yBot + 4.0f);
             }
             g.setColour (col::muted);
             g.drawVerticalLine (roundToInt (x), yTop, yBot);
-            const bool isSel = barA >= 0 && b >= jmin (barA, barB) && b <= jmax (barA, barB);
+            const bool isSel = rangeA >= 0 && c <= rangeB && c + bn - 1 >= rangeA;
             const float tw = b >= 9 ? 22.0f : 16.0f;
             g.setColour (isSel ? col::accent : col::btn);
             g.fillRoundedRectangle (x + 3.0f, 2.0f, tw, 11.0f, 3.0f);
             g.setColour (isSel ? col::bg : col::muted);
             g.setFont (fnt (10.0f, true));
             g.drawText (String (b + 1), Rectangle<float> (x + 3.0f, 2.0f, tw, 11.0f), Justification::centred, false);
-            c += sc.barCells[(size_t) b];
+            c += bn;
         }
         g.setColour (col::muted);
         g.drawVerticalLine (roundToInt (xEnd) - 1, yTop, yBot);
@@ -408,13 +435,14 @@ public:
     void mouseDown (const MouseEvent& e) override
     {
         grabKeyboardFocus();
+        beginDragAutoRepeat (40);
+        dragFromGrid = false;
         if (e.position.y < 14.0f)                                   // strip with the bar numbers
         {
             int bar;
             {
                 const ScopedLock sl (proc.lock);
-                const int c = jlimit (0, proc.score.totalCells() - 1, (int) std::floor ((e.position.x - x0) / cellW));
-                bar = proc.score.barOfCell (c);
+                bar = proc.score.barOfCell (cellAt (e.position.x));
             }
             selectBar (bar, e.mods.isShiftDown());
             return;
@@ -422,13 +450,51 @@ public:
         {
             const ScopedLock sl (proc.lock);
             const int n = proc.score.numStrings;
-            const int c = (int) std::floor ((e.position.x - x0) / cellW);
+            const int c = cellAt (e.position.x);
             const int r = roundToInt ((e.position.y - top) / rowSp (n));
-            selCell = jlimit (0, proc.score.totalCells() - 1, c);
-            selStr = jlimit (0, n - 1, n - 1 - jlimit (0, n - 1, r));
-            barA = barB = -1;
+            const int s = jlimit (0, n - 1, n - 1 - jlimit (0, n - 1, r));
+            if (e.mods.isShiftDown())
+            {
+                rangeA = jmin (anchor, c);
+                rangeB = slotEnd (snapStart (jmax (anchor, c)));
+                selCell = rangeA;
+                selStr = s;
+            }
+            else if (e.getNumberOfClicks() > 1 && ! e.mods.isPopupMenu())          // double click: the whole bar
+            {
+                const int b = proc.score.barOfCell (c);
+                rangeA = anchor = selCell = proc.score.barStart (b);
+                rangeB = rangeA + barLen (b) - 1;
+            }
+            else
+            {
+                selCell = pickCell (c, s);
+                selStr = s;
+                anchor = selCell;
+                rangeA = rangeB = -1;
+                dragFromGrid = ! e.mods.isPopupMenu();
+            }
         }
         if (e.mods.isPopupMenu()) clearNote();
+        repaint();
+        if (onSelection) onSelection();
+    }
+
+    void mouseDrag (const MouseEvent& e) override
+    {
+        if (! dragFromGrid || e.getDistanceFromDragStart() < 4) return;
+        if (auto* v = findParentComponentOfClass<Viewport>())
+        {
+            const auto p = e.getEventRelativeTo (v).position;
+            v->autoScroll ((int) p.x, (int) p.y, 24, 14);
+        }
+        {
+            const ScopedLock sl (proc.lock);
+            const int c = cellAt (e.position.x);
+            rangeA = snapStart (jmin (anchor, c));
+            rangeB = slotEnd (snapStart (jmax (anchor, c)));
+            selCell = rangeA;
+        }
         repaint();
         if (onSelection) onSelection();
     }
@@ -437,22 +503,29 @@ public:
     {
         const juce_wchar ch = k.getTextCharacter();
         const int code = k.getKeyCode();
+        const bool shift = k.getModifiers().isShiftDown();
         if (k.getModifiers().isCommandDown())
         {
             if (code == 'C') { copyBars(); return true; }
             if (code == 'X') { if (copyBars()) deleteBars(); return true; }
             if (code == 'V') { pasteBars(); return true; }
             if (code == 'Z') { undo(); return true; }
+            if (code == 'A')
+            {
+                { const ScopedLock sl (proc.lock); rangeA = 0; rangeB = proc.score.totalCells() - 1; anchor = selCell = 0; }
+                repaint(); if (onSelection) onSelection();
+                return true;
+            }
             return false;
         }
         if (ch >= '0' && ch <= '9') { typeDigit (ch - '0'); return true; }
-        if (code == KeyPress::leftKey)  { move (-1, 0); return true; }
-        if (code == KeyPress::rightKey) { move (1, 0); return true; }
-        if (code == KeyPress::upKey)    { move (0, 1); return true; }
-        if (code == KeyPress::downKey)  { move (0, -1); return true; }
-        if (code == KeyPress::returnKey || code == KeyPress::spaceKey) { move (jmax (1, selectedLength() > 0 ? selectedLength() : proc.duration), 0); return true; }
-        if (code == KeyPress::deleteKey || code == KeyPress::backspaceKey) { if (barA >= 0) deleteBars(); else clearNote(); return true; }
+        if (code == KeyPress::leftKey)  { moveCursor (-1, shift); return true; }
+        if (code == KeyPress::rightKey || code == KeyPress::returnKey || code == KeyPress::spaceKey) { moveCursor (1, shift && code == KeyPress::rightKey); return true; }
+        if (code == KeyPress::upKey)    { select (selCell, selStr + 1); return true; }
+        if (code == KeyPress::downKey)  { select (selCell, selStr - 1); return true; }
+        if (code == KeyPress::deleteKey || code == KeyPress::backspaceKey) { if (rangeA >= 0) deleteBars(); else clearNote(); return true; }
         if (code == KeyPress::homeKey) { select (0, selStr); return true; }
+        if (code == KeyPress::escapeKey) { select (selCell, selStr); return true; }
         return false;
     }
 
@@ -468,6 +541,43 @@ public:
 private:
     struct UndoState { std::vector<Cell> cells; std::vector<int> barCells; };
 
+    // ---- grid maths (call with proc.lock held) ---------------------------------------------------------
+    int barLen (int bar) const { return proc.score.barCells[(size_t) bar]; }
+    int stepIn (int bar) const { return jmax (1, jmin (proc.duration, barLen (bar))); }       // slot size of the grid in this bar
+    int barEndExclusive (int cell) const { const int b = proc.score.barOfCell (cell); return proc.score.barStart (b) + barLen (b); }
+    int cellAt (float x) const { return jlimit (0, proc.score.totalCells() - 1, (int) std::floor ((x - x0) / cellW)); }
+
+    int snapStart (int c) const                         // first cell of the grid slot that contains c
+    {
+        c = jlimit (0, proc.score.totalCells() - 1, c);
+        const int b = proc.score.barOfCell (c), bs = proc.score.barStart (b), step = stepIn (b);
+        return bs + ((c - bs) / step) * step;
+    }
+    int slotEnd (int slotStart) const                   // last cell of the slot that starts at slotStart
+    {
+        const int b = proc.score.barOfCell (slotStart);
+        return jmin (barEndExclusive (slotStart) - 1, slotStart + stepIn (b) - 1);
+    }
+    int newNoteLen (int cell) const { return jmax (1, jmin (proc.duration, barEndExclusive (cell) - cell)); }
+
+    /** A click lands on the note of that string that covers the cell, otherwise on the grid slot. */
+    int pickCell (int c, int s) const
+    {
+        const int bs = proc.score.barStart (proc.score.barOfCell (c));
+        for (int k = c; k >= bs && k > c - 16; --k)
+        {
+            const auto& cell = proc.score.cells[(size_t) k];
+            if (cell.fret[s] >= 0 && k + cell.len[s] > c) return k;
+        }
+        return snapStart (c);
+    }
+
+    int alignedBars (int lo, int hi) const              // number of whole bars in lo..hi, 0 if the range cuts a bar
+    {
+        const int b0 = proc.score.barOfCell (lo), b1 = proc.score.barOfCell (hi);
+        return (lo == proc.score.barStart (b0) && hi == proc.score.barStart (b1) + barLen (b1) - 1) ? b1 - b0 + 1 : 0;
+    }
+
     void info (const String& m) { if (onInfo) onInfo (m); }
     void edited()
     {
@@ -475,7 +585,31 @@ private:
         if (onEdited) onEdited();
         if (onSelection) onSelection();
     }
-    void move (int dc, int ds) { select (selCell + dc, selStr + ds); }
+
+    void moveCursor (int dir, bool extend)
+    {
+        int target;
+        {
+            const ScopedLock sl (proc.lock);
+            const int total = proc.score.totalCells();
+            if (dir > 0)
+            {
+                const int len = jmax (1, selectedLength() > 0 ? selectedLength() : newNoteLen (selCell));
+                const int next = selCell + len;
+                if (next >= total) target = selCell;
+                else { const int snapped = snapStart (next); target = snapped > selCell ? snapped : next; }
+            }
+            else target = selCell > 0 ? snapStart (selCell - 1) : 0;
+            if (extend)
+            {
+                rangeA = jmin (anchor, target);
+                rangeB = slotEnd (snapStart (jmax (anchor, target)));
+                selCell = target;
+            }
+        }
+        if (extend) { ensureVisible(); repaint(); if (onSelection) onSelection(); }
+        else select (target, selStr);
+    }
 
     void typeDigit (int d)
     {
@@ -504,9 +638,11 @@ private:
 
     TabMidiProcessor& proc;
     std::vector<UndoState> undoStack;
-    int barA = -1, barB = -1;                          // selected bars, -1 = none
+    int rangeA = -1, rangeB = -1;                      // selected cells (inclusive), -1 = no range
+    int anchor = 0;                                    // where a range selection started
+    bool dragFromGrid = false;
     static inline std::vector<Cell> clipCells;         // shared between plugin instances
-    static inline std::vector<int> clipBars;
+    static inline int clipBarCount = 0;
     uint32 lastDigitMs = 0;
     int lastCell = -1, lastStr = -1;
 };
@@ -1147,14 +1283,15 @@ private:
 };
 
 //==============================================================================
-/** The "drag me into the DAW" area. Starts an OS-level file drag with the generated .mid. */
+/** The "drag me into the DAW" area. Starts an OS-level drag of the generated .mid file(s). */
 class DragHandle : public Component
 {
 public:
     DragHandle() { setMouseCursor (MouseCursor::DraggingHandCursor); }
 
-    void setFile (const File& f) { file = f; repaint(); }
-    bool ready() const { return file.existsAsFile(); }
+    void setFiles (const std::vector<File>& f) { files = f; repaint(); }
+    void clearFiles() { files.clear(); repaint(); }
+    bool ready() const { for (auto& f : files) if (f.existsAsFile()) return true; return false; }
 
     void paint (Graphics& g) override
     {
@@ -1163,25 +1300,29 @@ public:
         g.fillRoundedRectangle (r, 8.0f);
         g.setColour (ready() ? col::accent : col::btnLine);
         g.drawRoundedRectangle (r, 8.0f, 1.4f);
-        // grip dots
         g.setColour (ready() ? col::accent : col::muted);
         for (int i = 0; i < 6; ++i)
             g.fillEllipse (14.0f + (float) (i % 2) * 6.0f, r.getCentreY() - 8.0f + (float) (i / 2) * 6.0f, 3.0f, 3.0f);
         g.setColour (ready() ? col::text : col::muted);
         g.setFont (fnt (13.0f, true));
-        g.drawText (ready() ? "Перетащить MIDI в DAW"_ru : "Сначала MAKE MIDI"_ru, getLocalBounds().withTrimmedLeft (36), Justification::centredLeft, true);
+        const String text = ! ready() ? "Сначала MAKE MIDI"_ru
+                          : files.size() > 1 ? "В DAW: "_ru + String ((int) files.size()) + " дорожек"_ru
+                                             : "Перетащить MIDI в DAW"_ru;
+        g.drawText (text, getLocalBounds().withTrimmedLeft (36), Justification::centredLeft, true);
     }
 
     void mouseDrag (const MouseEvent& e) override
     {
         if (! ready() || dragging || e.getDistanceFromDragStart() < 6) return;
+        StringArray paths;
+        for (auto& f : files) if (f.existsAsFile()) paths.add (f.getFullPathName());
         dragging = true;
-        DragAndDropContainer::performExternalDragDropOfFiles (StringArray (file.getFullPathName()), false, this, [this] { dragging = false; });
+        DragAndDropContainer::performExternalDragDropOfFiles (paths, false, this, [this] { dragging = false; });
         dragging = false;
     }
 
 private:
-    File file;
+    std::vector<File> files;
     bool dragging = false;
 };
 
@@ -1202,7 +1343,7 @@ public:
 
 private:
     void loadFile (const File& f);
-    void importTrack (int index);
+    void importTrack (int index, bool sameSong);
     void makeMidi();
     void saveMidiAs();
     void setBars (int n);
@@ -1213,8 +1354,6 @@ private:
     void updateTabButtons();
     void refreshScaleBox();
     void openScaleEditor (bool editCurrent);
-    int minWidth() const;
-    void updateChordsButton (bool resizeWindow);
 
     TabMidiProcessor& proc;
     TabLnF lnf;
@@ -1225,9 +1364,9 @@ private:
     String midiStatus, currentName;
     bool dropError = false, dragOver = false;
 
-    TextButton copyBtn { "Копировать"_ru }, pasteBtn { "Вставить"_ru }, delBarBtn { "Удалить такт"_ru }, undoBtn { "Отменить"_ru }, chordsBtn;
+    TextButton copyBtn { "Копировать"_ru }, pasteBtn { "Вставить"_ru }, delBarBtn { "Очистить"_ru }, undoBtn { "Отменить"_ru };
     ChordPanel chordPanel;
-    TextButton openBtn { "Открыть…"_ru }, makeBtn { "MAKE MIDI" }, saveBtn { "Сохранить .mid…"_ru }, presetBtn { "Standard" };
+    TextButton openBtn { "Открыть…"_ru }, makeBtn { "MAKE MIDI" }, saveBtn { "Сохранить…"_ru }, modeBtn { "Раздельно"_ru }, presetBtn { "Standard" };
     ComboBox trackBox, rootBox, scaleBox;
     OwnedArray<TextButton> barBtns, strBtns, chipBtns, durBtns, viewBtns;
     DragHandle dragHandle;

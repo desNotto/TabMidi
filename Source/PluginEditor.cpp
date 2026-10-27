@@ -12,26 +12,27 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
 {
     setLookAndFeel (&lnf);
     setResizable (true, true);                                      // the layout follows the window size
-    setResizeLimits (minWidth(), kMinH, 3200, 1800);
-    setSize (jlimit (minWidth(), 3200, p.editorW > 0 ? p.editorW : minWidth()),
+    setResizeLimits (kWideW, kMinH, 3200, 1800);
+    setSize (jlimit (kWideW, 3200, p.editorW > 0 ? p.editorW : kWideW),
              jlimit (kMinH, 1800, p.editorH > 0 ? p.editorH : kMinH));
 
     for (auto* b : { &openBtn, &makeBtn, &saveBtn, &presetBtn }) addAndMakeVisible (b);
-    for (auto* b : { &copyBtn, &pasteBtn, &delBarBtn, &undoBtn, &chordsBtn }) addAndMakeVisible (b);
+    for (auto* b : { &copyBtn, &pasteBtn, &delBarBtn, &undoBtn, &modeBtn }) addAndMakeVisible (b);
     addAndMakeVisible (chordPanel);
     copyBtn.onClick   = [this] { canvas.copyBars();   canvas.grabKeyboardFocus(); };
     pasteBtn.onClick  = [this] { canvas.pasteBars();  canvas.grabKeyboardFocus(); };
     delBarBtn.onClick = [this] { canvas.deleteBars(); canvas.grabKeyboardFocus(); };
     undoBtn.onClick   = [this] { canvas.undo();       canvas.grabKeyboardFocus(); };
-    chordsBtn.onClick = [this]
-    {
-        { const ScopedLock sl (proc.lock); proc.showChords = ! proc.showChords; }
-        updateChordsButton (true);
-    };
     chordPanel.onToggle = [this] (int root, int type)
     {
         if (chordPanel.isSelected (root, type)) { chordPanel.clearSelection(); fretboard.clearChord(); }
         else { chordPanel.setSelection (root, type); fretboard.setChord (root, chordTypes()[(size_t) type]); }
+    };
+    modeBtn.onClick = [this]
+    {
+        { const ScopedLock sl (proc.lock); proc.exportSeparate = ! proc.exportSeparate; }
+        refreshAll();
+        if (dragHandle.ready()) makeMidi();                          // rebuild the files in the new mode
     };
     makeBtn.setColour (TextButton::buttonColourId, col::accent);
     makeBtn.setColour (TextButton::textColourOffId, col::bg);
@@ -47,7 +48,7 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
 
     addAndMakeVisible (dragHandle);
     addChildComponent (trackBox);
-    trackBox.onChange = [this] { importTrack (trackBox.getSelectedId() - 1); };
+    trackBox.onChange = [this] { importTrack (trackBox.getSelectedId() - 1, true); };
 
     for (int v : { 4, 8, 16 })
     {
@@ -102,8 +103,13 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
         b->setRadioGroupId (104);
         b->onClick = [this, v]
         {
-            { const ScopedLock sl (proc.lock); proc.viewBars = v; }
-            canvas.refreshSize();
+            canvas.pushUndo();
+            {
+                const ScopedLock sl (proc.lock);
+                proc.viewBars = v;
+                if (proc.score.numBars() < v) { proc.score.setBarCount (v); proc.markEdited(); }   // an empty staff grows to the shown length
+            }
+            refreshAll();
             viewport.setViewPosition (jmax (0, (int) (TabCanvas::x0 + (float) canvas.selCell * canvas.cellW) - 80), 0);
             canvas.repaint();
         };
@@ -121,19 +127,10 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     {
         fretboard.repaint();
         updateTabButtons();
-        if (dragHandle.ready()) { dragHandle.setFile ({}); midiStatus = "Таб изменён: нажмите MAKE MIDI"_ru; repaint(); }
+        if (dragHandle.ready()) { dragHandle.clearFiles(); midiStatus = "Таб изменён: нажмите MAKE MIDI"_ru; repaint(); }
     };
     canvas.onSelection = [this]
     {
-        const int len = canvas.selectedLength();                  // the duration buttons follow the selected chord
-        for (int i = 0; i < 5; ++i)
-            if (len == kDurations[i])
-            {
-                { const ScopedLock sl (proc.lock); proc.duration = len; }
-                for (int k = 0; k < 5; ++k) durBtns[k]->setToggleState (k == i, dontSendNotification);
-                repaint();
-                break;
-            }
         fretboard.repaint();
         updateTabButtons();
     };
@@ -141,7 +138,6 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     canvas.onInfo = [this] (const String& m) { midiStatus = m; repaint(); };
     fretboard.onPick = [this] (int s, int f) { canvas.toggleNote (s, f); canvas.grabKeyboardFocus(); };
 
-    updateChordsButton (false);
     resized();
     refreshAll();
 }
@@ -178,70 +174,111 @@ void TabMidiEditor::loadFile (const File& f)
     gp = std::move (g);
     currentName = f.getFileNameWithoutExtension();
 
-    // pick the track with the most notes first; the others stay available in the list
-    int best = 0, bestCount = -1;
+    // the track with the most notes opens in the editor first; the others stay available in the list
+    int best = -1, bestCount = -1;
     trackBox.clear (dontSendNotification);
     for (int i = 0; i < (int) gp->tracks.size(); ++i)
     {
-        ImportResult r; int count = 0;
-        if (gp->importTrack (i, r))
-            for (auto& c : r.score.cells)
-                for (int s = 0; s < kMaxStrings; ++s) if (c.fret[s] >= 0) ++count;
+        const int count = gp->noteCount (i);
         trackBox.addItem (gp->tracks[(size_t) i].name + " · "_ru + String (gp->tracks[(size_t) i].tuning.size()) + " str", i + 1);
         if (count > bestCount) { bestCount = count; best = i; }
     }
-    trackBox.setSelectedId (best + 1, dontSendNotification);
     trackBox.setVisible (gp->tracks.size() > 1);
-    importTrack (best);
+    if (best >= 0)
+    {
+        trackBox.setSelectedId (best + 1, dontSendNotification);
+        importTrack (best, false);
+    }
+    else                                                     // no 6-9 string guitar track: the whole song still goes to MIDI
+    {
+        ImportResult r;
+        gp->importSongOnly (r);
+        const int bars = r.totalBars;
+        proc.setImported (std::move (r), currentName, false);
+        canvas.clearHistory();
+        dropTitle = currentName;
+        dropInfo = String (bars) + " тактов · "_ru + String (proc.exportTrackCount()) + " дорожек в MIDI (в редактор не подходят)"_ru;
+        midiStatus = {};
+        dragHandle.clearFiles();
+        refreshAll();
+    }
 }
 
-void TabMidiEditor::importTrack (int index)
+void TabMidiEditor::importTrack (int index, bool sameSong)
 {
     if (gp == nullptr) return;
     ImportResult r;
     if (! gp->importTrack (index, r)) return;
 
-    dropTitle = currentName;
-    dropInfo = String (r.totalBars) + " тактов · "_ru + String (r.score.numStrings) + " струн"_ru;
-    if (r.truncated) dropInfo << " · в редакторе первые "_ru << kMaxBars;
-    proc.setImported (std::move (r), currentName);
+    const int bars = r.totalBars, strings = r.score.numStrings;
+    const bool truncated = r.truncated;
+    proc.setImported (std::move (r), currentName, sameSong);
     canvas.clearHistory();
+    dropTitle = currentName;
+    dropInfo = String (bars) + " тактов"_ru + (truncated ? " (в редакторе "_ru + String (kMaxBars) + ")"_ru : String())
+             + " · "_ru + String (proc.exportTrackCount()) + " дорожек в MIDI"_ru;
+    juce::ignoreUnused (strings);
     midiStatus = {};
-    dragHandle.setFile ({});
+    dragHandle.clearFiles();
     canvas.select (0, 0);
     refreshAll();
 }
 
 void TabMidiEditor::makeMidi()
 {
-    const auto f = proc.makeMidiFile();
-    if (f.existsAsFile()) { dragHandle.setFile (f); midiStatus = f.getFileName() + " готов, тяните в DAW"_ru; }
+    bool separate;
+    { const ScopedLock sl (proc.lock); separate = proc.exportSeparate; }
+    const auto files = proc.makeMidiFiles (separate);
+    if (! files.empty())
+    {
+        dragHandle.setFiles (files);
+        midiStatus = files.size() > 1 ? "Готово: "_ru + String ((int) files.size()) + " MIDI-файлов, тяните в DAW"_ru
+                                      : files.front().getFileName() + " готов, тяните в DAW"_ru;
+    }
     else midiStatus = "Не удалось записать MIDI-файл"_ru;
     repaint();
 }
 
 void TabMidiEditor::saveMidiAs()
 {
-    const auto src = proc.makeMidiFile();
-    if (! src.existsAsFile()) return;
-    dragHandle.setFile (src);
-    midiStatus = src.getFileName() + " готов, тяните в DAW"_ru;
+    bool separate;
+    { const ScopedLock sl (proc.lock); separate = proc.exportSeparate; }
+    const auto files = proc.makeMidiFiles (separate);
+    if (files.empty()) return;
+    dragHandle.setFiles (files);
+    midiStatus = "Готово, выберите куда сохранить"_ru;
     repaint();
 
-    chooser = std::make_unique<FileChooser> ("Сохранить MIDI"_ru, File::getSpecialLocation (File::userDocumentsDirectory).getChildFile (src.getFileName()), "*.mid");
-    chooser->launchAsync (FileBrowserComponent::saveMode | FileBrowserComponent::canSelectFiles | FileBrowserComponent::warnAboutOverwriting,
-                          [src] (const FileChooser& fc)
-                          {
-                              auto dest = fc.getResult();
-                              if (dest != File()) src.copyFileTo (dest.withFileExtension ("mid"));
-                          });
+    const auto docs = File::getSpecialLocation (File::userDocumentsDirectory);
+    if (files.size() == 1)
+    {
+        const File src = files.front();
+        chooser = std::make_unique<FileChooser> ("Сохранить MIDI"_ru, docs.getChildFile (src.getFileName()), "*.mid");
+        chooser->launchAsync (FileBrowserComponent::saveMode | FileBrowserComponent::canSelectFiles | FileBrowserComponent::warnAboutOverwriting,
+                              [src] (const FileChooser& fc)
+                              {
+                                  auto dest = fc.getResult();
+                                  if (dest != File()) src.copyFileTo (dest.withFileExtension ("mid"));
+                              });
+    }
+    else                                                     // several files: pick a folder for all of them
+    {
+        chooser = std::make_unique<FileChooser> ("Папка для MIDI-файлов"_ru, docs);
+        chooser->launchAsync (FileBrowserComponent::openMode | FileBrowserComponent::canSelectDirectories,
+                              [files] (const FileChooser& fc)
+                              {
+                                  const auto dir = fc.getResult();
+                                  if (dir != File() && dir.isDirectory())
+                                      for (auto& f : files) f.copyFileTo (dir.getChildFile (f.getFileName()));
+                              });
+    }
 }
 
 //==============================================================================
 void TabMidiEditor::setBars (int n)
 {
     canvas.pushUndo();
-    { const ScopedLock sl (proc.lock); proc.score.setBarCount (n); proc.markEdited(); }
+    { const ScopedLock sl (proc.lock); proc.score.setBarCount (n); proc.viewBars = jmin (proc.viewBars, n); proc.markEdited(); }
     canvas.onEdited();
     refreshAll();
 }
@@ -314,25 +351,6 @@ void TabMidiEditor::updateTabButtons()
     undoBtn.setEnabled (canvas.canUndo());
 }
 
-void TabMidiEditor::updateChordsButton (bool resizeWindow)
-{
-    bool show;
-    { const ScopedLock sl (proc.lock); show = proc.showChords; }
-    chordsBtn.setButtonText ("Аккорды "_ru + String::fromUTF8 (show ? "\xe2\x97\x84" : "\xe2\x96\xba"));
-    chordPanel.setVisible (show);
-    setResizeLimits (minWidth(), kMinH, 3200, 1800);
-    if (resizeWindow)
-    {
-        const int w = jlimit (minWidth(), 3200, getWidth() + (show ? kPanelW + 16 : -(kPanelW + 16)));
-        if (w != getWidth()) setSize (w, getHeight()); else resized();
-    }
-}
-
-int TabMidiEditor::minWidth() const
-{
-    const ScopedLock sl (proc.lock);
-    return proc.showChords ? kWideW : kMainW;
-}
 
 void TabMidiEditor::refreshScaleBox()
 {
@@ -391,6 +409,7 @@ void TabMidiEditor::refreshAll()
     scaleBox.setSelectedId (scale + 1, dontSendNotification);
     for (int i = 0; i < 5; ++i) durBtns[i]->setToggleState (kDurations[i] == dur, dontSendNotification);
     { int k2 = 0; for (int v : { 4, 8, 16 }) viewBtns[k2++]->setToggleState (proc.viewBars == v, dontSendNotification); }
+    modeBtn.setButtonText (proc.exportSeparate ? "Раздельно"_ru : "Одним файлом"_ru);
     refreshScaleBox();
     chordPanel.repaint();
     canvas.refreshSize();
@@ -405,16 +424,16 @@ void TabMidiEditor::resized()
 {
     const int pad = 16, gap = 12;
     const int W = getWidth(), H = getHeight();
-    bool showPanel;
-    { const ScopedLock sl (proc.lock); showPanel = proc.showChords; proc.editorW = W; proc.editorH = H; }
-    const int mainW = showPanel ? W - kPanelW - 16 : W;                // main area is [0, mainW], the chord panel sits to its right
+    { const ScopedLock sl (proc.lock); proc.editorW = W; proc.editorH = H; }
+    const int mainW = W - kPanelW - 16;                // main area is [0, mainW], the chord panel sits to its right
     const int right = mainW - pad;
 
     rDrag = { right - 210, pad, 210, 72 };
     makeBtn.setBounds (rDrag.getX() - gap - 180, pad, 180, 72);
     rDrop = { pad, pad, makeBtn.getX() - gap - pad, 72 };
     dragHandle.setBounds (rDrag.getX() + 8, rDrag.getY() + 7, rDrag.getWidth() - 16, 36);
-    saveBtn.setBounds (rDrag.getX() + 8, rDrag.getY() + 47, rDrag.getWidth() - 16, 20);
+    saveBtn.setBounds (rDrag.getX() + 8, rDrag.getY() + 47, (rDrag.getWidth() - 22) / 2, 20);
+    modeBtn.setBounds (saveBtn.getRight() + 6, rDrag.getY() + 47, (rDrag.getWidth() - 22) / 2, 20);
     openBtn.setBounds (rDrop.getRight() - 12 - 100, rDrop.getY() + 22, 100, 28);
     trackBox.setBounds (openBtn.getX() - 8 - 190, rDrop.getY() + 22, 190, 28);
 
@@ -449,7 +468,6 @@ void TabMidiEditor::resized()
         int bx = rTab.getRight() - 14;
         for (int i = 3; i >= 0; --i) { bx -= bw[i]; arr[i]->setBounds (bx, rTab.getY() + 7, bw[i], 24); bx -= 6; }
     }
-    chordsBtn.setBounds (rFret.getRight() - 14 - 120, rFret.getY() + 6, 120, 28);
     chordPanel.setBounds (mainW, pad, kPanelW, H - 2 * pad);
 
     viewport.setBounds (rTab.reduced (8, 0).withTrimmedTop (36).withTrimmedBottom (8));

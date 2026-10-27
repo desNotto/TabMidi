@@ -1,6 +1,7 @@
 // Developer tool: renders the plugin window to PNG files without a DAW.
 #include "../Source/PluginProcessor.h"
 #include "../Source/PluginEditor.h"
+#include <set>
 using namespace tabmidi;
 
 static void snap (Component& c, const String& path)
@@ -95,6 +96,109 @@ static TextButton* findButton (Component& c, const String& text, int skip = 0)
     return nullptr;
 }
 
+static void gpExportAndGridTests (const String& gpPath)
+{
+    // ---- 1. every track of a Guitar Pro file reaches MIDI
+    String err;
+    auto gp = GpFile::load (File (gpPath), err);
+    CHECK (gp != nullptr);
+    if (gp != nullptr)
+    {
+        TabMidiProcessor p;
+        TabCanvas cv (p);
+        ImportResult r;
+        const int editable = gp->noteCount (0) > 0 ? 0 : -1;
+        if (editable >= 0) gp->importTrack (0, r); else gp->importSongOnly (r);
+        std::printf ("      file has %d tracks, %d of them can open in the editor\n", gp->trackCount(), (int) gp->tracks.size());
+        p.setImported (std::move (r), "song", false);
+        const int withNotes = p.exportTrackCount();
+        CHECK (withNotes >= 2);
+
+        const auto separate = p.makeMidiFiles (true);
+        CHECK ((int) separate.size() == withNotes);
+        const auto combined = p.makeMidiFiles (false);
+        CHECK (combined.size() == 1);
+        MidiFile mf;
+        { FileInputStream in (combined.front()); CHECK (mf.readFrom (in)); }
+        std::printf ("      separate files: %d, combined file has %d MIDI tracks (1 conductor + %d)\n", (int) separate.size(), mf.getNumTracks(), mf.getNumTracks() - 1);
+        CHECK (mf.getNumTracks() == withNotes + 1);
+        std::set<int> channels;
+        for (int t = 1; t < mf.getNumTracks(); ++t)
+            for (int i = 0; i < mf.getTrack (t)->getNumEvents(); ++i)
+                if (mf.getTrack (t)->getEventPointer (i)->message.isNoteOn()) { channels.insert (mf.getTrack (t)->getEventPointer (i)->message.getChannel()); break; }
+        CHECK ((int) channels.size() == withNotes);                               // each track has its own channel
+
+        // an edit of the editor track goes into its file only
+        const auto before = separate.front().getSize();
+        cv.select (0, 0); cv.putNote (0, 7);
+        const auto afterEdit = p.makeMidiFiles (true);
+        CHECK (afterEdit.size() == separate.size());
+        std::printf ("      first file before/after an edit in the editor: %d / %d bytes\n", (int) before, (int) afterEdit.front().getSize());
+    }
+
+    // ---- 2. the grid follows the note length: a whole note only at the start of a bar
+    {
+        TabMidiProcessor p;
+        p.score.reset (4, 6, builtInTunings (6)[0].pitches, "Standard");
+        TabCanvas cv (p);
+        cv.setBounds (0, 0, 1000, 200);
+        cv.refreshSize();
+        const float x0 = TabCanvas::x0, w = cv.cellW;
+        p.duration = 16;                                              // whole note
+        cv.mouseDown (MouseEvent (Desktop::getInstance().getMainMouseSource(), Point<float> (x0 + 8.5f * w, 60.0f), ModifierKeys(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, &cv, &cv, Time::getCurrentTime(), Point<float> (x0 + 8.5f * w, 60.0f), Time::getCurrentTime(), 1, false));
+        CHECK (cv.selCell == 0);                                      // clicked in the middle of bar 1, lands on its start
+        cv.putNote (2, 5);
+        CHECK (p.score.cells[0].len[2] == 16);
+        cv.keyPressed (KeyPress (KeyPress::rightKey));
+        CHECK (cv.selCell == 16);                                     // next slot = next bar
+        p.duration = 8;                                               // half note
+        cv.applyDurationToSelection();
+        cv.select (11, 2);
+        cv.snapSelectionToGrid();
+        CHECK (cv.selCell == 8);
+        cv.putNote (2, 3);
+        CHECK (p.score.cells[8].len[2] == 8);
+        p.duration = 16;
+        cv.select (24, 2); cv.snapSelectionToGrid();
+        CHECK (cv.selCell == 16);
+        // a note that is longer than the room left in the bar is cut at the bar line
+        p.duration = 8; cv.select (14, 3); cv.putNote (3, 4);
+        p.duration = 8;
+        CHECK (p.score.cells[14].len[3] == 2);
+    }
+
+    // ---- 3. drag selection and Shift+arrows select cells, Delete clears them
+    {
+        TabMidiProcessor p;
+        p.score.reset (4, 6, builtInTunings (6)[0].pitches, "Standard");
+        p.duration = 1;
+        for (int i = 0; i < 20; ++i) p.score.cells[(size_t) i].fret[1] = 3;
+        TabCanvas cv (p);
+        cv.setBounds (0, 0, 1000, 200);
+        cv.refreshSize();
+        cv.select (2, 1);
+        for (int i = 0; i < 5; ++i) cv.keyPressed (KeyPress (KeyPress::rightKey, ModifierKeys (ModifierKeys::shiftModifier), 0));
+        CHECK (cv.hasBarSelection());
+        cv.keyPressed (KeyPress (KeyPress::deleteKey));
+        CHECK (p.score.cells[2].fret[1] == -1 && p.score.cells[7].fret[1] == -1 && p.score.cells[8].fret[1] == 3 && p.score.cells[1].fret[1] == 3);
+        cv.undo();
+        CHECK (p.score.cells[4].fret[1] == 3);
+    }
+
+    // ---- 4. a fresh plugin: 8 strings, Drop E, E minor, 4 bars; "visible bars" grows an empty staff
+    {
+        TabMidiProcessor p;
+        CHECK (p.score.numStrings == 8 && p.score.tuningName == "Drop E" && p.score.numBars() == 4);
+        CHECK (p.keyRoot == 4 && scaleAt (p.keyScale).name == "Minor" && p.viewBars == 4);
+        std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
+        TextButton* b16 = nullptr;
+        for (auto* ch : ed->getChildren()) if (auto* b = dynamic_cast<TextButton*> (ch)) if (b->getButtonText() == "16" && b->getRadioGroupId() == 104) b16 = b;
+        CHECK (b16 != nullptr);
+        if (b16 != nullptr) { b16->onClick(); }
+        CHECK (p.viewBars == 16 && p.score.numBars() == 16);
+    }
+}
+
 static void scaleAndTuningTests()
 {
     ScaleStore::file().deleteFile();
@@ -155,6 +259,7 @@ int main (int argc, char** argv)
     ScopedJuceInitialiser_GUI init;
     behaviourTests();
     scaleAndTuningTests();
+    gpExportAndGridTests (argc > 2 ? argv[2] : "");
     String out = argc > 1 ? argv[1] : "/tmp/snap";
     File (out).createDirectory();
 
@@ -168,8 +273,24 @@ int main (int argc, char** argv)
         TabMidiProcessor proc;
         std::unique_ptr<AudioProcessorEditor> ed (proc.createEditor());
         dynamic_cast<TabMidiEditor*> (ed.get())->filesDropped (StringArray (argv[2]), 0, 0);
+        click (findButton (*ed, "MAKE MIDI"));                                     // the drag area now holds every track
         snap (*ed, out + "/2_imported.png");
-        proc.makeMidiFile();
+    }
+    {   // 13. the grid follows the note length: whole note selected
+        TabMidiProcessor p;
+        p.duration = 16;
+        auto put = [&p] (int cell, std::initializer_list<std::pair<int, int>> notes, int len)
+        {
+            for (auto& n : notes) { p.score.cells[(size_t) cell].fret[n.first] = n.second; p.score.cells[(size_t) cell].len[n.first] = len; }
+        };
+        put (0,  { { 2, 0 }, { 3, 2 }, { 4, 2 }, { 5, 0 }, { 6, 0 }, { 7, 0 } }, 16);           // Em, whole note
+        put (16, { { 3, 0 }, { 4, 2 }, { 5, 2 }, { 6, 1 }, { 7, 0 } }, 8);                      // Am, half note
+        put (24, { { 3, 2 }, { 4, 2 }, { 5, 0 }, { 6, 0 }, { 7, 0 } }, 8);                      // second half
+        put (32, { { 1, 0 } }, 4); put (36, { { 1, 3 } }, 4); put (40, { { 1, 5 } }, 4); put (44, { { 1, 3 } }, 4);   // quarters
+        std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
+        if (auto* cv = findCanvas (*ed)) cv->select (48, 3);                       // empty bar 4, cursor spans the whole bar
+        snap (*ed, out + "/13_whole_note_grid.png");
+        if (auto* cv = findCanvas (*ed)) { cv->select (16, 3); cv->mouseDown (MouseEvent (Desktop::getInstance().getMainMouseSource(), Point<float> (TabCanvas::x0 + 4.0f * cv->cellW, 60.0f), ModifierKeys(), 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, cv, cv, Time::getCurrentTime(), Point<float> (TabCanvas::x0 + 4.0f * cv->cellW, 60.0f), Time::getCurrentTime(), 1, false)); }
     }
     {   // 7. the view from the latest request: 8 strings, Drop E, E minor, a bar selected, chord Gmaj7 from the helper panel
         TabMidiProcessor p;
@@ -244,7 +365,7 @@ int main (int argc, char** argv)
         MemoryBlock mb; a.getStateInformation (mb);
         TabMidiProcessor b; b.setStateInformation (mb.getData(), (int) mb.getSize());
         std::printf ("state roundtrip: strings=%d bars=%d tuning=%s key=%d/%d notes[0]=%d midi=%s\n", b.score.numStrings, b.score.numBars(),
-                     b.score.tuningName.toRawUTF8(), b.keyRoot, b.keyScale, b.score.cells[0].fret[0], b.makeMidiFile().getFileName().toRawUTF8());
+                     b.score.tuningName.toRawUTF8(), b.keyRoot, b.keyScale, b.score.cells[0].fret[0], b.makeMidiFiles (true).front().getFileName().toRawUTF8());
         std::unique_ptr<AudioProcessorEditor> ed (b.createEditor());
         snap (*ed, out + "/3_dorian_7str.png");
         TuningEditor te (b, nullptr);

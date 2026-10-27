@@ -19,31 +19,34 @@ int main (int argc, char** argv)
     String err;
     auto gp = GpFile::load (File (argv[1]), err);
     if (gp == nullptr) { std::printf ("ERROR: %s\n", err.toRawUTF8()); return 2; }
-    std::printf ("title: %s, tracks: %d\n", gp->title.toRawUTF8(), (int) gp->tracks.size());
-    for (size_t i = 0; i < gp->tracks.size(); ++i)
+    std::printf ("title: %s, tracks in file: %d, editable guitar tracks: %d\n", gp->title.toRawUTF8(), gp->trackCount(), (int) gp->tracks.size());
+
+    ImportResult whole;
+    gp->importSongOnly (whole);
+    std::printf ("tempo/time map: %d tempo events, %d time signatures\n", (int) whole.song.tempos.size(), (int) whole.song.sigs.size());
+    for (size_t i = 0; i < whole.song.tracks.size(); ++i)
+    {
+        auto& t = whole.song.tracks[i];
+        int lo = 127, hi = 0;
+        for (auto& n : t.notes) { lo = jmin (lo, n.pitch); hi = jmax (hi, n.pitch); }
+        std::printf ("  [%d] %-22s notes=%-5d %s%s\n", (int) i, t.name.toRawUTF8(), (int) t.notes.size(),
+                     t.notes.empty() ? "" : ("pitch " + String (lo) + ".." + String (hi)).toRawUTF8(), t.drums ? "  (drums)" : "");
+        if (argc > 2 && ! t.notes.empty())
+        {
+            File out (String (argv[2]) + "_" + String ((int) i) + ".mid");
+            out.deleteFile();
+            auto os = out.createOutputStream();
+            buildMidiFile (t.notes, whole.song.tempos, whole.song.sigs, t.name, t.drums ? 10 : 1).writeTo (*os, 1);
+        }
+    }
+    for (int i = 0; i < (int) gp->tracks.size(); ++i)
     {
         ImportResult r;
-        gp->importTrack ((int) i, r);
-        int notes = 0, chords = 0;
-        for (auto& c : r.score.cells) { int k = 0; for (int s = 0; s < 9; ++s) if (c.fret[s] >= 0) ++k; notes += k; if (k > 1) ++chords; }
-        std::printf ("  [%d] %s strings=%d capo=%d bars=%d (editor %d) notes=%d chordCols=%d tempo=%d\n", (int) i,
-                     gp->tracks[i].name.toRawUTF8(), gp->tracks[i].tuning.size(), gp->tracks[i].capo,
-                     r.totalBars, r.score.numBars(), notes, chords, r.score.tempo);
-        if (argc > 2)
-        {
-            File out (String (argv[2]) + "_" + String ((int) i) + "_exact.mid");
-            out.deleteFile(); { auto os = out.createOutputStream(); r.exact.writeTo (*os, 1); }
-            File out2 (String (argv[2]) + "_" + String ((int) i) + "_quant.mid");
-            out2.deleteFile(); { auto os = out2.createOutputStream(); r.score.toMidiFile().writeTo (*os, 1); }
-            if (i == 0)
-            {
-                for (int c = 0; c < jmin (r.score.totalCells(), 64); ++c)
-                {
-                    auto p = r.score.pitchesAt (c);
-                    if (! p.empty()) std::printf ("   cell %2d: %s  %s\n", c, chordName (p).toRawUTF8(), String (p.size()).toRawUTF8());
-                }
-            }
-        }
+        gp->importTrack (i, r);
+        int cols = 0;
+        for (auto& c : r.score.cells) { int k = 0; for (int s = 0; s < 9; ++s) if (c.fret[s] >= 0) ++k; if (k > 1) ++cols; }
+        std::printf ("  editor track %d: %s, %d strings, %d bars (editor %d), chord columns %d\n", i, gp->tracks[(size_t) i].name.toRawUTF8(),
+                     gp->tracks[(size_t) i].tuning.size(), r.totalBars, r.score.numBars(), cols);
     }
     return 0;
 }

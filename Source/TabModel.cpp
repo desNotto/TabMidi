@@ -2,13 +2,13 @@
 
 namespace tabmidi
 {
-MidiFile buildMidiFile (std::vector<NoteEv> notes, const std::vector<TempoEv>& tempos,
-                        const std::vector<SigEv>& sigs, const String& trackName)
+MidiFile buildMidiFileMulti (const std::vector<MidiTrackSpec>& specs, const std::vector<TempoEv>& tempos,
+                             const std::vector<SigEv>& sigs)
 {
     MidiFile mf;
     mf.setTicksPerQuarterNote (kPPQ);
 
-    MidiMessageSequence conductor, track;
+    MidiMessageSequence conductor;
     bool tempoAtZero = false;
     for (auto& t : tempos)
     {
@@ -29,31 +29,41 @@ MidiFile buildMidiFile (std::vector<NoteEv> notes, const std::vector<TempoEv>& t
         m.setTimeStamp (s.tick);
         conductor.addEvent (m);
     }
+    mf.addTrack (conductor);
 
     struct Ev { double t; int order; MidiMessage m; };
-    std::vector<Ev> evs;
-    for (auto& n : notes)
+    for (auto& spec : specs)
     {
-        if (n.len <= 0) continue;
-        const int pitch = jlimit (0, 127, n.pitch);
-        evs.push_back ({ (double) n.start, 1, MidiMessage::noteOn (1, pitch, (uint8) jlimit (1, 127, n.vel)) });
-        evs.push_back ({ (double) (n.start + n.len), 0, MidiMessage::noteOff (1, pitch) });
-    }
-    std::stable_sort (evs.begin(), evs.end(), [] (const Ev& a, const Ev& b)
-                      { return a.t < b.t || (a.t == b.t && a.order < b.order); });
+        const int ch = jlimit (1, 16, spec.channel);
+        std::vector<Ev> evs;
+        for (auto& n : spec.notes)
+        {
+            if (n.len <= 0) continue;
+            const int pitch = jlimit (0, 127, n.pitch);
+            evs.push_back ({ (double) n.start, 1, MidiMessage::noteOn (ch, pitch, (uint8) jlimit (1, 127, n.vel)) });
+            evs.push_back ({ (double) (n.start + n.len), 0, MidiMessage::noteOff (ch, pitch) });
+        }
+        std::stable_sort (evs.begin(), evs.end(), [] (const Ev& a, const Ev& b)
+                          { return a.t < b.t || (a.t == b.t && a.order < b.order); });
 
-    auto nm = MidiMessage::textMetaEvent (3, trackName);
-    nm.setTimeStamp (0);
-    track.addEvent (nm);
-    for (auto& e : evs)
-    {
-        e.m.setTimeStamp (e.t);
-        track.addEvent (e.m);
+        MidiMessageSequence track;
+        auto nm = MidiMessage::textMetaEvent (3, spec.name);
+        nm.setTimeStamp (0);
+        track.addEvent (nm);
+        for (auto& e : evs)
+        {
+            e.m.setTimeStamp (e.t);
+            track.addEvent (e.m);
+        }
+        mf.addTrack (track);
     }
-
-    mf.addTrack (conductor);
-    mf.addTrack (track);
     return mf;
+}
+
+MidiFile buildMidiFile (std::vector<NoteEv> notes, const std::vector<TempoEv>& tempos,
+                        const std::vector<SigEv>& sigs, const String& trackName, int channel)
+{
+    return buildMidiFileMulti ({ { trackName, std::move (notes), channel } }, tempos, sigs);
 }
 
 //==============================================================================
@@ -118,7 +128,7 @@ std::vector<int> TabScore::pitchesAt (int cell) const
     return p;
 }
 
-MidiFile TabScore::toMidiFile() const
+std::vector<NoteEv> TabScore::toNoteEvents() const
 {
     std::vector<NoteEv> notes;
     for (int c = 0; c < totalCells(); ++c)
@@ -126,7 +136,11 @@ MidiFile TabScore::toMidiFile() const
             if (cells[(size_t) c].fret[s] >= 0)
                 notes.push_back ({ c * kCellTicks, jmax (1, cells[(size_t) c].len[s]) * kCellTicks,
                                    pitchOf (s, cells[(size_t) c].fret[s]), 100 });
+    return notes;
+}
 
+MidiFile TabScore::toMidiFile() const
+{
     std::vector<SigEv> sigs;
     int tick = 0;
     for (int cellsInBar : barCells)
@@ -138,7 +152,7 @@ MidiFile TabScore::toMidiFile() const
             sigs.push_back ({ tick, num, den });
         tick += cellsInBar * kCellTicks;
     }
-    return buildMidiFile (notes, { { 0, (double) tempo } }, sigs, "Tab");
+    return buildMidiFile (toNoteEvents(), { { 0, (double) tempo } }, sigs, "Tab");
 }
 
 static String intsToString (const int* v, int n)

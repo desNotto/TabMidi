@@ -26,8 +26,14 @@ struct NoteEv  { int start, len, pitch, vel; };
 struct TempoEv { int tick; double bpm; };
 struct SigEv   { int tick, num, den; };
 
+struct MidiTrackSpec { String name; std::vector<NoteEv> notes; int channel = 1; };
+
+/** One MIDI file (format 1) with a conductor track (tempo, time signature) and one track per spec, each on its own channel. */
+MidiFile buildMidiFileMulti (const std::vector<MidiTrackSpec>& tracks, const std::vector<TempoEv>& tempos,
+                             const std::vector<SigEv>& sigs);
+
 MidiFile buildMidiFile (std::vector<NoteEv> notes, const std::vector<TempoEv>& tempos,
-                        const std::vector<SigEv>& sigs, const String& trackName);
+                        const std::vector<SigEv>& sigs, const String& trackName, int channel = 1);
 
 struct TabScore
 {
@@ -38,7 +44,7 @@ struct TabScore
     std::vector<int> barCells;        // cells per bar (16 for 4/4)
     std::vector<Cell> cells;          // all bars, concatenated
 
-    TabScore() { reset (4, 6, builtInTunings (6)[0].pitches, "Standard"); }
+    TabScore() { reset (4, 8, builtInTunings (8)[1].pitches, "Drop E"); }
 
     void reset (int bars, int strings, const Array<int>& tun, const String& tunName);
     void setBarCount (int n);
@@ -51,6 +57,7 @@ struct TabScore
     int pitchOf (int stringIdx, int fret) const { return tuning[stringIdx] + fret; }
     std::vector<int> pitchesAt (int cell) const;
 
+    std::vector<NoteEv> toNoteEvents() const;
     MidiFile toMidiFile() const;
     std::unique_ptr<XmlElement> toXml() const;
     bool fromXml (const XmlElement& e);

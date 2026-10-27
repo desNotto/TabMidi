@@ -113,6 +113,28 @@ const XmlElement* findProperty (const XmlElement* e, const String& name)
     return nullptr;
 }
 
+const XmlElement* findElement (const XmlElement* e, const String& tag)
+{
+    if (e == nullptr) return nullptr;
+    for (auto* c : e->getChildIterator())
+    {
+        if (c->hasTagName (tag)) return c;
+        if (auto* r = findElement (c, tag)) return r;
+    }
+    return nullptr;
+}
+
+/** Guitar Pro 6 drum notes are (element, variation); this is the usual General MIDI drum note for each. */
+int gp6DrumNote (int element, int variation)
+{
+    static const int t[17][3] = {
+        { 36, 36, 36 }, { 38, 37, 38 }, { 56, 56, 56 }, { 56, 56, 56 }, { 56, 56, 56 }, { 43, 43, 43 },
+        { 45, 45, 45 }, { 47, 47, 47 }, { 48, 48, 48 }, { 50, 50, 50 }, { 42, 46, 46 }, { 44, 44, 44 },
+        { 57, 57, 57 }, { 49, 49, 49 }, { 55, 55, 55 }, { 51, 59, 53 }, { 52, 52, 52 } };
+    if (element < 0 || element > 16) return 38;
+    return t[element][jlimit (0, 2, variation)];
+}
+
 int dynamicVelocity (const XmlElement* d)
 {
     if (d == nullptr) return 92;
@@ -175,7 +197,6 @@ bool GpFile::parse (const String& xml, String& error)
     if (auto* sc = root->getChildByName ("Score"))
         if (auto* t = sc->getChildByName ("Title")) title = t->getAllSubText().trim();
 
-    // master bars
     if (auto* mbs = root->getChildByName ("MasterBars"))
         for (auto* e : mbs->getChildIterator())
         {
@@ -198,7 +219,6 @@ bool GpFile::parse (const String& xml, String& error)
         }
     if (masterBars.empty()) { error = "В файле нет тактов"_ru; return false; }
 
-    // tempo
     if (auto* mt = root->getChildByName ("MasterTrack"))
         if (auto* au = mt->getChildByName ("Automations"))
             for (auto* a : au->getChildIterator())
@@ -213,26 +233,38 @@ bool GpFile::parse (const String& xml, String& error)
                 if (x.bpm > 0) tempoAutos.push_back (x);
             }
 
-    // tracks
     if (auto* ts = root->getChildByName ("Tracks"))
     {
         int ordinal = 0;
         for (auto* t : ts->getChildIterator())
         {
             if (! t->hasTagName ("Track")) continue;
-            Track tr; tr.ordinal = ordinal++;
+            Track tr;
+            tr.ordinal = ordinal++;
             if (auto* n = t->getChildByName ("Name")) tr.name = n->getAllSubText().trim();
             if (tr.name.isEmpty()) tr.name = "Track " + String (tr.ordinal + 1);
-            tr.capo = 0;
             if (auto* tp = findProperty (t, "Tuning"))
                 for (int v : toInts (tp->getChildByName ("Pitches"))) tr.tuning.add (v);
             if (auto* cp = findProperty (t, "CapoFret"))
                 if (auto* fr = cp->getChildByName ("Fret")) tr.capo = fr->getAllSubText().getIntValue();
-            if (tr.tuning.size() >= 6 && tr.tuning.size() <= kMaxStrings)
+            if (auto* ins = findElement (t, "Instrument"))
+                if (ins->getStringAttribute ("ref").startsWith ("drm")) tr.drums = true;
+            if (auto* iset = findElement (t, "InstrumentSet"))
+            {
+                if (auto* ty = iset->getChildByName ("Type"))
+                    if (ty->getAllSubText().trim() == "drumKit") tr.drums = true;
+                if (auto* els = iset->getChildByName ("Elements"))
+                    for (auto* el : els->getChildIterator())
+                        if (auto* arts = el->getChildByName ("Articulations"))
+                            for (auto* ar : arts->getChildIterator())
+                                tr.drumOut.push_back (ar->getChildByName ("OutputMidiNumber") ? ar->getChildByName ("OutputMidiNumber")->getAllSubText().getIntValue() : 38);
+            }
+            allTracks.push_back (tr);
+            if (! tr.drums && tr.tuning.size() >= 6 && tr.tuning.size() <= kMaxStrings)
                 tracks.push_back (tr);
         }
     }
-    if (tracks.empty()) { error = "В файле нет гитарных дорожек с 6–9 струнами"_ru; return false; }
+    if (allTracks.empty()) { error = "В файле нет дорожек"_ru; return false; }
     return true;
 }
 
@@ -259,41 +291,31 @@ int GpFile::rhythmTicks (int id) const
     return jmax (1, roundToInt (t));
 }
 
-bool GpFile::importTrack (int listIndex, ImportResult& out) const
+/** Play order (repeats / alternate endings expanded), bar lengths, time signatures and tempo changes. */
+void GpFile::ensureTimeline() const
 {
-    if (listIndex < 0 || listIndex >= (int) tracks.size()) return false;
-    const Track& tr = tracks[(size_t) listIndex];
-    const int ns = tr.tuning.size();
+    if (timelineBuilt) return;
+    timelineBuilt = true;
 
-    // play order with repeats / alternate endings
-    std::vector<int> order;
+    std::map<int, int> passes;
+    int start = 0, i = 0, guard = 0;
+    while (i < (int) masterBars.size() && guard++ < 5000 && order.size() < 600)
     {
-        std::map<int, int> passes;
-        int start = 0, i = 0, guard = 0;
-        while (i < (int) masterBars.size() && guard++ < 5000 && order.size() < 600)
+        const MasterBar& m = masterBars[(size_t) i];
+        if (m.repStart) start = i;
+        const int play = passes[start] + 1;
+        if (! m.alt.empty() && std::find (m.alt.begin(), m.alt.end(), play) == m.alt.end()) { ++i; continue; }
+        order.push_back (i);
+        if (m.repEnd)
         {
-            const MasterBar& m = masterBars[(size_t) i];
-            if (m.repStart) start = i;
-            const int play = passes[start] + 1;
-            if (! m.alt.empty() && std::find (m.alt.begin(), m.alt.end(), play) == m.alt.end()) { ++i; continue; }
-            order.push_back (i);
-            if (m.repEnd)
-            {
-                int& p = passes[start];
-                if (p + 1 < m.repCount) { ++p; i = start; continue; }
-                p = 0;
-            }
-            ++i;
+            int& p = passes[start];
+            if (p + 1 < m.repCount) { ++p; i = start; continue; }
+            p = 0;
         }
+        ++i;
     }
 
-    struct Imp { int start, len, str, fret, vel; };
-    std::vector<Imp> imps;
-    std::vector<SigEv> sigs;
-    std::vector<TempoEv> tempos;
-    std::vector<int> barTicks;
     int T = 0;
-
     for (int mi : order)
     {
         const MasterBar& m = masterBars[(size_t) mi];
@@ -302,7 +324,23 @@ bool GpFile::importTrack (int listIndex, ImportResult& out) const
         if (sigs.empty() || sigs.back().num != m.num || sigs.back().den != m.den) sigs.push_back ({ T, m.num, m.den });
         for (auto& a : tempoAutos)
             if (a.bar == mi) tempos.push_back ({ T + roundToInt (a.pos * barLen), a.bpm });
+        T += barLen;
+    }
+}
 
+const std::vector<GpFile::Imp>& GpFile::notesOf (const Track& tr) const
+{
+    auto cached = cache.find (tr.ordinal);
+    if (cached != cache.end()) return cached->second;
+
+    ensureTimeline();
+    std::vector<Imp> imps;
+    const int ns = tr.tuning.size();
+    int T = 0;
+
+    for (size_t k = 0; k < order.size(); ++k)
+    {
+        const MasterBar& m = masterBars[(size_t) order[k]];
         if (tr.ordinal < (int) m.barIds.size())
         {
             auto bit = bars.find (m.barIds[(size_t) tr.ordinal]);
@@ -327,42 +365,106 @@ bool GpFile::importTrack (int listIndex, ImportResult& out) const
                         {
                             auto nit = notes.find (nid);
                             if (nit == notes.end()) continue;
-                            int str = -1, fret = -1;
+                            int str = -1, fret = -1, midi = -1, element = -1, variation = 0, tone = -1, octave = -1;
                             if (auto* props = nit->second->getChildByName ("Properties"))
                                 for (auto* p : props->getChildIterator())
                                 {
                                     const String nm = p->getStringAttribute ("name");
-                                    if (nm == "String" && p->getChildByName ("String")) str = p->getChildByName ("String")->getAllSubText().getIntValue();
-                                    if (nm == "Fret" && p->getChildByName ("Fret"))     fret = p->getChildByName ("Fret")->getAllSubText().getIntValue();
+                                    auto num = [p] (const char* child) { auto* c = p->getChildByName (child); return c ? c->getAllSubText().getIntValue() : -1; };
+                                    if (nm == "String")         str = num ("String");
+                                    else if (nm == "Fret")      fret = num ("Fret");
+                                    else if (nm == "Midi")      midi = num ("Number");
+                                    else if (nm == "Element")   element = num ("Element");
+                                    else if (nm == "Variation") variation = jmax (0, num ("Variation"));
+                                    else if (nm == "Tone")      tone = num ("Step");
+                                    else if (nm == "Octave")    octave = num ("Number");
                                 }
-                            if (str < 0 || str >= ns || fret < 0) continue;
+                            const int artic = nit->second->getChildByName ("InstrumentArticulation")
+                                                ? nit->second->getChildByName ("InstrumentArticulation")->getAllSubText().getIntValue() : -1;
+
+                            Imp imp { T + t, dur, vel, -1, -1, -1 };
+                            if (tr.drums)
+                            {
+                                if (artic >= 0 && artic < (int) tr.drumOut.size()) imp.midi = tr.drumOut[(size_t) artic];
+                                else if (element >= 0) imp.midi = gp6DrumNote (element, variation);
+                                else if (midi >= 0) imp.midi = midi;
+                                else continue;
+                            }
+                            else if (str >= 0 && fret >= 0 && ns > 0)
+                            {
+                                if (str >= ns) continue;
+                                imp.str = str; imp.fret = fret;
+                            }
+                            else if (midi >= 0)                imp.midi = midi;
+                            else if (tone >= 0 && octave >= 0) imp.midi = octave * 12 + tone;
+                            else if (element >= 0)             imp.midi = gp6DrumNote (element, variation);
+                            else continue;
 
                             bool tied = false;
                             if (auto* tie = nit->second->getChildByName ("Tie"))
                                 if (tie->getStringAttribute ("destination") == "true")
-                                    for (int k = (int) imps.size() - 1; k >= 0 && k >= (int) imps.size() - 64; --k)
-                                        if (imps[(size_t) k].str == str && imps[(size_t) k].fret == fret
-                                            && std::abs (imps[(size_t) k].start + imps[(size_t) k].len - (T + t)) <= 8)
+                                    for (int q = (int) imps.size() - 1; q >= 0 && q >= (int) imps.size() - 64; --q)
+                                        if (imps[(size_t) q].str == imp.str && imps[(size_t) q].fret == imp.fret && imps[(size_t) q].midi == imp.midi
+                                            && std::abs (imps[(size_t) q].start + imps[(size_t) q].len - (T + t)) <= 8)
                                         {
-                                            imps[(size_t) k].len = T + t + dur - imps[(size_t) k].start;
+                                            imps[(size_t) q].len = T + t + dur - imps[(size_t) q].start;
                                             tied = true;
                                             break;
                                         }
-                            if (! tied) imps.push_back ({ T + t, dur, str, fret, vel });
+                            if (! tied) imps.push_back (imp);
                         }
                         t += dur;
                     }
                 }
         }
-        T += barLen;
+        T += barTicks[k];
     }
+    return cache.emplace (tr.ordinal, std::move (imps)).first->second;
+}
 
-    // exact MIDI
-    std::vector<NoteEv> evs;
-    for (auto& n : imps) evs.push_back ({ n.start, n.len, tr.tuning[n.str] + tr.capo + n.fret, n.vel });
-    out.exact = buildMidiFile (evs, tempos, sigs, tr.name);
+void GpFile::fillSong (SongData& song) const
+{
+    ensureTimeline();
+    song.tracks.clear();
+    for (auto& tr : allTracks)
+    {
+        ExportTrack et;
+        et.name = tr.name;
+        et.drums = tr.drums;
+        for (auto& n : notesOf (tr))
+        {
+            const int pitch = pitchOf (tr, n);
+            if (pitch >= 0 && pitch <= 127) et.notes.push_back ({ n.start, n.len, pitch, n.vel });
+        }
+        song.tracks.push_back (std::move (et));
+    }
+    song.tempos = tempos;
+    song.sigs = sigs;
+}
 
-    // quantised, editable score
+int GpFile::noteCount (int listIndex) const
+{
+    if (listIndex < 0 || listIndex >= (int) tracks.size()) return 0;
+    return (int) notesOf (tracks[(size_t) listIndex]).size();
+}
+
+bool GpFile::importSongOnly (ImportResult& out) const
+{
+    fillSong (out.song);
+    out.hasEditorTrack = false;
+    out.title = title;
+    out.totalBars = (int) order.size();
+    return true;
+}
+
+bool GpFile::importTrack (int listIndex, ImportResult& out) const
+{
+    if (listIndex < 0 || listIndex >= (int) tracks.size()) return false;
+    const Track& tr = tracks[(size_t) listIndex];
+    const int ns = tr.tuning.size();
+    fillSong (out.song);
+    const auto& imps = notesOf (tr);
+
     Array<int> tun;
     for (int v : tr.tuning) tun.add (v + tr.capo);
     TabScore& sc = out.score;
@@ -383,11 +485,14 @@ bool GpFile::importTrack (int listIndex, ImportResult& out) const
     sc.cells.assign ((size_t) total, Cell());
     for (auto& n : imps)
     {
+        if (n.str < 0) continue;
         const int c = roundToInt (n.start / (double) kCellTicks);
         if (c < 0 || c >= total) continue;
         sc.cells[(size_t) c].fret[n.str] = n.fret;
         sc.cells[(size_t) c].len[n.str] = jmax (1, roundToInt (n.len / (double) kCellTicks));
     }
+    out.hasEditorTrack = true;
+    out.editorTrack = tr.ordinal;
     out.title = title.isNotEmpty() ? title : tr.name;
     return true;
 }
