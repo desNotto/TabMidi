@@ -1,5 +1,6 @@
 #pragma once
 #include "PluginProcessor.h"
+#include <array>
 
 namespace tabmidi
 {
@@ -82,8 +83,11 @@ public:
         if (barA >= proc.score.numBars() || barB >= proc.score.numBars()) barA = barB = -1;
         float viewW = 990.0f;
         if (auto* v = findParentComponentOfClass<Viewport>()) viewW = (float) v->getMaximumVisibleWidth();
-        const float fit = (viewW - x0 - 12.0f) / (float) jmax (1, total);
-        cellW = total <= 64 ? jlimit (12.0f, 26.0f, std::floor (fit * 10.0f) / 10.0f) : 16.0f;
+        const int shown = jmin (proc.viewBars, proc.score.numBars());          // bars visible at once
+        int cellsShown = 0;
+        for (int b = 0; b < shown; ++b) cellsShown += proc.score.barCells[(size_t) b];
+        const float fit = (viewW - x0 - 12.0f) / (float) jmax (1, cellsShown);
+        cellW = jlimit (2.5f, 26.0f, std::floor (fit * 10.0f) / 10.0f);
         setSize ((int) (x0 + (float) total * cellW + 12.0f), (int) (top + (float) (n - 1) * rowSp (n) + 14.0f));
     }
 
@@ -323,9 +327,9 @@ public:
         else
         {
             g.setColour (col::accent.withAlpha (0.12f));
-            g.fillRoundedRectangle (x0 + (float) selCell * cellW + 1.0f, yTop - 9.0f, cellW - 2.0f, yBot - yTop + 18.0f, 4.0f);
+            g.fillRoundedRectangle (x0 + (float) selCell * cellW + 1.0f, yTop - 9.0f, jmax (2.0f, cellW - 2.0f), yBot - yTop + 18.0f, 4.0f);
             g.setColour (col::accent);
-            g.drawRoundedRectangle (x0 + (float) selCell * cellW + 1.5f, rowY (selStr) - sp * 0.5f, cellW - 3.0f, sp, 3.0f, 1.2f);
+            g.drawRoundedRectangle (x0 + (float) selCell * cellW + 1.5f, rowY (selStr) - sp * 0.5f, jmax (1.5f, cellW - 3.0f), sp, 3.0f, 1.2f);
         }
 
         // strings
@@ -363,7 +367,9 @@ public:
         g.drawText ("A", 10, roundToInt (mid) - 6, 20, 14, Justification::centred, false);
         g.drawText ("B", 10, roundToInt (mid) + 8, 20, 14, Justification::centred, false);
 
-        // notes
+        // notes (digits shrink when many bars are shown at once)
+        const float fs = jlimit (8.0f, 11.5f, cellW * 0.8f + 2.0f);
+        float lastChordRight = -1000.0f;
         for (int i = 0; i < sc.totalCells(); ++i)
         {
             const auto& cell = sc.cells[(size_t) i];
@@ -377,21 +383,23 @@ public:
                 g.setColour (col::accent.withAlpha (0.45f));
                 g.drawHorizontalLine (roundToInt (y), cx, x0 + (float) (i + cell.len[s]) * cellW - 3.0f);
                 const String t (cell.fret[s]);
-                const float w = t.length() > 1 ? 15.0f : 9.0f;
+                const float w = (float) t.length() * fs * 0.62f + 2.0f;
                 g.setColour (col::panel);
-                g.fillRect (cx - w * 0.5f, y - 7.0f, w, 14.0f);
+                g.fillRect (cx - w * 0.5f, y - fs * 0.6f, w, fs * 1.2f);
                 g.setColour (col::text);
-                g.setFont (mono (11.0f, true));
-                g.drawText (t, Rectangle<float> (cx - 10.0f, y - 7.0f, 20.0f, 14.0f), Justification::centred, false);
+                g.setFont (mono (fs, true));
+                g.drawText (t, Rectangle<float> (cx - 12.0f, y - 7.0f, 24.0f, 14.0f), Justification::centred, false);
             }
             if (count > 1)
             {
                 const String nm = chordName (sc.pitchesAt (i));
-                if (nm.isNotEmpty())
+                const float tw = (float) nm.length() * 7.4f + 8.0f;
+                if (nm.isNotEmpty() && cx - tw * 0.5f >= lastChordRight)     // labels that would collide are skipped
                 {
                     g.setColour (col::accent);
                     g.setFont (fnt (13.0f, true));
                     g.drawText (nm, Rectangle<float> (cx - 45.0f, 15.0f, 90.0f, 16.0f), Justification::centred, false);
+                    lastChordRight = cx + tw * 0.5f;
                 }
             }
         }
@@ -504,13 +512,13 @@ private:
 };
 
 //==============================================================================
-/** Virtual fretboard. Shows the notes of the key (name + scale degree), or, while a chord from the
-    helper panel is active, the notes of that chord (name + chord degree). Open strings always show
-    their note, notes of the selected tab column get a white outline. */
+/** Virtual fretboard with 24 frets. Fret widths shrink like on a real guitar. Shows the notes of the key
+    (name + scale degree), or, while a chord from the helper panel is active, the notes of that chord
+    (name + chord degree). Open strings always show their note, notes of the selected tab column get a white outline. */
 class FretboardView : public Component
 {
 public:
-    static constexpr int kFrets = 15;
+    static constexpr int kFrets = 24;
     std::function<void (int stringIdx, int fret)> onPick;
 
     FretboardView (TabMidiProcessor& p, const TabCanvas& c) : proc (p), canvas (c) {}
@@ -527,7 +535,7 @@ public:
         const float yTop = geo.y0, yBot = geo.y0 + (float) n * geo.sp;
 
         g.setColour (col::btnLine);
-        for (int f = 1; f <= kFrets; ++f) g.drawVerticalLine (roundToInt (geo.nutX + (float) f * geo.fw), yTop, yBot);
+        for (int f = 1; f <= kFrets; ++f) g.drawVerticalLine (roundToInt (fretX (geo, f)), yTop, yBot);
         g.setColour (col::muted);
         g.fillRect (geo.nutX - 2.0f, yTop, 4.0f, yBot - yTop);
 
@@ -538,45 +546,17 @@ public:
             g.fillRect (geo.nutX, geo.yOf (s, n) - th * 0.5f, (float) getWidth() - geo.nutX - 6.0f, th);
         }
 
-        g.setFont (fnt (11.0f));
+        g.setFont (fnt (10.5f));
         g.setColour (col::muted);
-        for (int f : { 3, 5, 7, 9, 12, 15 })
-            g.drawText (String (f), Rectangle<float> (geo.nutX + ((float) f - 0.5f) * geo.fw - 14.0f, yBot + 3.0f, 28.0f, 14.0f), Justification::centred, false);
+        for (int f : { 3, 5, 7, 9, 12, 15, 17, 19, 21, 24 })
+        {
+            const float cx = (fretX (geo, f - 1) + fretX (geo, f)) * 0.5f;
+            g.drawText (String (f), Rectangle<float> (cx - 12.0f, yBot + 3.0f, 24.0f, 14.0f), Justification::centred, false);
+        }
 
         const bool chordMode = chordType != nullptr;
         forEachPill (n, [&] (int s, int f, const Marker& m, Rectangle<float> r, bool selected)
-        {
-            const int midi = sc.pitchOf (s, f);
-            if (m.kind == 0)                                   // outside the key: open string or a note from the tab
-            {
-                auto small = r.withSizeKeepingCentre (32.0f, r.getHeight());
-                g.setColour (col::panel);
-                g.fillRoundedRectangle (small, small.getHeight() * 0.5f);
-                g.setColour (col::btnLine);
-                g.drawRoundedRectangle (small.reduced (0.5f), small.getHeight() * 0.5f, 1.2f);
-                g.setFont (fnt (12.0f, true));
-                g.setColour (col::muted);
-                g.drawText (noteName (midi), small, Justification::centred, false);
-            }
-            else
-            {
-                const bool isRoot = m.kind == 1;
-                g.setColour (isRoot ? col::accent : (chordMode ? col::chordTone : col::dot));
-                g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
-                g.setFont (fnt (12.0f, true));
-                g.setColour (isRoot ? col::bg : Colours::white);
-                g.drawText (noteName (midi), r.withWidth (27.0f).withTrimmedLeft (3.0f), Justification::centred, false);
-                g.setFont (fnt (11.0f, true));
-                g.setColour (isRoot ? col::bg : (chordMode ? Colour (0xffd6e6ff) : col::deg));
-                g.drawText (m.deg, r.withTrimmedLeft (25.0f).withTrimmedRight (2.0f), Justification::centred, false);
-            }
-            if (selected)
-            {
-                const auto o = (m.kind == 0 ? r.withSizeKeepingCentre (32.0f, r.getHeight()) : r).expanded (2.5f);
-                g.setColour (Colours::white);
-                g.drawRoundedRectangle (o, o.getHeight() * 0.5f, 2.0f);
-            }
-        });
+                     { drawPill (g, r, m, sc.pitchOf (s, f), chordMode, selected); });
     }
 
     void mouseDown (const MouseEvent& e) override
@@ -595,7 +575,7 @@ private:
 
     struct Geo
     {
-        float nutX, fw, sp, y0;
+        float nutX, span, sp, y0;
         float yOf (int s, int n) const { return y0 + (float) (n - 1 - s) * sp + sp * 0.5f; }
     };
 
@@ -603,10 +583,84 @@ private:
     {
         Geo g;
         g.nutX = 56.0f;
-        g.fw = ((float) getWidth() - g.nutX - 8.0f) / (float) kFrets;
-        g.sp = jmin (38.0f, ((float) getHeight() - 22.0f) / (float) n);
+        g.span = (float) getWidth() - g.nutX - 8.0f;
+        g.sp = jmin (46.0f, ((float) getHeight() - 22.0f) / (float) n);
         g.y0 = 2.0f;
         return g;
+    }
+
+    /** Distance of fret f from the nut: every fret is 2^(-1/12) shorter than the previous one, like on a real neck. */
+    static float fretX (const Geo& g, int f)
+    {
+        static const double q = std::pow (2.0, -1.0 / 12.0);
+        static const double norm = 1.0 - std::pow (q, (double) kFrets);
+        return g.nutX + (float) ((double) g.span * (1.0 - std::pow (q, (double) f)) / norm);
+    }
+
+    Rectangle<float> pillRect (const Geo& g, int n, int s, int f) const
+    {
+        const float cy = g.yOf (s, n);
+        if (f == 0)
+        {
+            const float h = jmin (24.0f, g.sp - 3.0f);
+            return { g.nutX - 53.0f, cy - h * 0.5f, 46.0f, h };
+        }
+        const float xa = fretX (g, f - 1), xb = fretX (g, f);
+        const float pw = jlimit (17.0f, 46.0f, xb - xa - 3.0f);
+        const float h = pw >= 40.0f ? jmin (24.0f, g.sp - 3.0f) : jmin (28.0f, g.sp - 2.0f);
+        return { (xa + xb) * 0.5f - pw * 0.5f, cy - h * 0.5f, pw, h };
+    }
+
+    void drawPill (Graphics& g, Rectangle<float> r, const Marker& m, int midi, bool chordMode, bool selected) const
+    {
+        auto outline = [&g] (Rectangle<float> b)
+        {
+            const auto o = b.expanded (2.5f);
+            g.setColour (Colours::white);
+            g.drawRoundedRectangle (o, jmin (o.getWidth(), o.getHeight()) * 0.5f, 2.0f);
+        };
+
+        if (m.kind == 0)                                       // outside the key: open string or a note from the tab
+        {
+            const auto small = r.withSizeKeepingCentre (jmin (32.0f, r.getWidth()), r.getHeight());
+            const float rad = jmin (small.getWidth(), small.getHeight()) * 0.5f;
+            g.setColour (col::panel);
+            g.fillRoundedRectangle (small, rad);
+            g.setColour (col::btnLine);
+            g.drawRoundedRectangle (small.reduced (0.5f), rad, 1.2f);
+            g.setFont (fnt (jlimit (9.0f, 12.0f, small.getWidth() * 0.45f), true));
+            g.setColour (col::muted);
+            g.drawText (noteName (midi), small, Justification::centred, false);
+            if (selected) outline (small);
+            return;
+        }
+
+        const bool isRoot = m.kind == 1;
+        g.setColour (isRoot ? col::accent : (chordMode ? col::chordTone : col::dot));
+        g.fillRoundedRectangle (r, jmin (r.getWidth(), r.getHeight()) * 0.5f);
+        const Colour noteCol = isRoot ? col::bg : Colours::white;
+        const Colour degCol = isRoot ? col::bg : (chordMode ? Colour (0xffd6e6ff) : col::deg);
+
+        if (r.getWidth() >= 40.0f)                             // wide fret: "E 5" side by side
+        {
+            g.setFont (fnt (12.0f, true));
+            g.setColour (noteCol);
+            g.drawText (noteName (midi), r.withWidth (27.0f).withTrimmedLeft (3.0f), Justification::centred, false);
+            g.setFont (fnt (11.0f, true));
+            g.setColour (degCol);
+            g.drawText (m.deg, r.withTrimmedLeft (25.0f).withTrimmedRight (2.0f), Justification::centred, false);
+        }
+        else                                                   // narrow fret: note above, degree below
+        {
+            const float fs = jlimit (9.0f, 12.0f, r.getWidth() * 0.5f);
+            g.setFont (fnt (fs, true));
+            g.setColour (noteCol);
+            g.drawText (noteName (midi), Rectangle<float> (r.getX(), r.getY() + 1.0f, r.getWidth(), r.getHeight() * 0.5f), Justification::centred, false);
+            g.setFont (fnt (fs - 1.0f, true));
+            g.setColour (degCol);
+            g.drawText (m.deg, Rectangle<float> (r.getX(), r.getCentreY() - 1.0f, r.getWidth(), r.getHeight() * 0.5f), Justification::centred, false);
+        }
+        if (selected) outline (r);
     }
 
     Marker markerFor (int midi) const
@@ -623,7 +677,7 @@ private:
         }
         else
         {
-            const int d = degreeOf (midi, proc.keyRoot, scales()[(size_t) proc.keyScale]);
+            const int d = degreeOf (midi, proc.keyRoot, scaleAt (proc.keyScale));
             if (d > 0) { m.kind = d == 1 ? 1 : 2; m.deg = String (d); }
         }
         return m;
@@ -641,9 +695,7 @@ private:
                 const Marker m = markerFor (proc.score.pitchOf (s, f));
                 const bool selected = std::find (sel.begin(), sel.end(), std::make_pair (s, f)) != sel.end();
                 if (m.kind == 0 && f != 0 && ! selected) continue;
-                const float cx = f == 0 ? geo.nutX - 30.0f : geo.nutX + ((float) f - 0.5f) * geo.fw;
-                const float h = jmin (24.0f, geo.sp - 3.0f);
-                fn (s, f, m, Rectangle<float> (cx - 23.0f, geo.yOf (s, n) - h * 0.5f, 46.0f, h), selected);
+                fn (s, f, m, pillRect (geo, n, s, f), selected);
             }
     }
 
@@ -676,9 +728,10 @@ public:
         g.setColour (col::line);
         g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.5f), 10.0f, 1.0f);
 
-        int keyRoot, keyScale;
-        { const ScopedLock sl (proc.lock); keyRoot = proc.keyRoot; keyScale = proc.keyScale; }
-        const auto& sc = scales()[(size_t) keyScale];
+        int keyRoot;
+        Scale sc;
+        { const ScopedLock sl (proc.lock); keyRoot = proc.keyRoot; sc = scaleAt (proc.keyScale); }
+        cols = (int) sc.iv.size();
 
         g.setColour (col::muted);
         g.setFont (fnt (11.0f, true));
@@ -711,9 +764,10 @@ public:
 
     void mouseDown (const MouseEvent& e) override
     {
-        int keyRoot, keyScale;
-        { const ScopedLock sl (proc.lock); keyRoot = proc.keyRoot; keyScale = proc.keyScale; }
-        const auto& sc = scales()[(size_t) keyScale];
+        int keyRoot;
+        Scale sc;
+        { const ScopedLock sl (proc.lock); keyRoot = proc.keyRoot; sc = scaleAt (proc.keyScale); }
+        cols = (int) sc.iv.size();
         for (int c = 0; c < (int) sc.iv.size(); ++c)
             for (int r = 0; r < kRows; ++r)
                 if (cellRect (c, r).contains (e.position))
@@ -726,7 +780,7 @@ public:
 private:
     Rectangle<float> cellRect (int col, int row) const      // row -1 = column header
     {
-        const float colW = ((float) getWidth() - 20.0f) / 7.0f;
+        const float colW = ((float) getWidth() - 20.0f) / (float) jmax (7, cols);
         const float rowH = ((float) getHeight() - 70.0f - 10.0f) / (float) kRows;
         const float y = row < 0 ? 46.0f : 70.0f + (float) row * rowH;
         return { 10.0f + (float) col * colW + 2.0f, y + 1.0f, colW - 4.0f, (row < 0 ? 20.0f : rowH) - 2.0f };
@@ -734,13 +788,16 @@ private:
 
     TabMidiProcessor& proc;
     int selRoot = -1, selType = -1;
+    int cols = 7;
 };
 
 //==============================================================================
-/** Pop-up with a note stepper for every string, presets and saving of custom tunings. */
+/** Pop-up with a note stepper for every string, a stepper for the whole tuning, presets and saving of custom tunings. */
 class TuningEditor : public Component
 {
 public:
+    static constexpr int kRow0 = 96;
+
     TuningEditor (TabMidiProcessor& p, std::function<void()> changed) : proc (p), onChanged (std::move (changed))
     {
         {
@@ -749,6 +806,13 @@ public:
             name = proc.score.tuningName;
         }
         n = pitches.size();
+
+        allMinus.setButtonText (String::fromUTF8 ("\xe2\x88\x92"));
+        allPlus.setButtonText ("+");
+        allMinus.onClick = [this] { shiftAll (-1); };
+        allPlus.onClick  = [this] { shiftAll (+1); };
+        addAndMakeVisible (allMinus);
+        addAndMakeVisible (allPlus);
 
         for (int i = 0; i < n; ++i)
         {
@@ -783,7 +847,7 @@ public:
 
         rebuildPresets();
         refreshLabels();
-        setSize (380, 56 + n * 32 + 96);
+        setSize (380, kRow0 + n * 32 + 96);
     }
 
     void paint (Graphics& g) override
@@ -792,25 +856,38 @@ public:
         g.setColour (col::muted);
         g.setFont (fnt (11.0f, true));
         g.drawText ("СТРОЙ · "_ru + String (n) + " СТРУН"_ru, 14, 8, 200, 14, Justification::left, false);
+
+        g.setFont (fnt (12.0f, true));
+        g.setColour (col::text);
+        g.drawText ("Весь строй"_ru, 14, 58, 80, 28, Justification::left, false);
         g.setFont (fnt (12.0f));
+        g.setColour (col::muted);
+        g.drawText ("все струны"_ru, 130, 58, 70, 28, Justification::centred, false);
+        g.drawText ("на полутон"_ru, 252, 58, 108, 28, Justification::centredRight, false);
+        g.setColour (col::line);
+        g.fillRect (14, kRow0 - 6, getWidth() - 28, 1);
+
+        g.setColour (col::muted);
         for (int i = 0; i < n; ++i)
-            g.drawText ("Струна "_ru + String (i + 1), 14, 56 + i * 32, 70, 28, Justification::left, false);
+            g.drawText ("Струна "_ru + String (i + 1), 14, kRow0 + i * 32, 70, 28, Justification::left, false);
         g.setFont (fnt (11.0f));
-        g.drawText ("Шаг — полутон, справа сдвиг от стандартного строя"_ru, 14, 56 + n * 32 + 4, 352, 14, Justification::left, false);
+        g.drawText ("Шаг — полутон, справа сдвиг от стандартного строя"_ru, 14, kRow0 + n * 32 + 4, 352, 14, Justification::left, false);
     }
 
     void resized() override
     {
         presets.setBounds (14, 24, getWidth() - 28, 26);
+        allMinus.setBounds (96, 58, 30, 28);
+        allPlus.setBounds (204, 58, 30, 28);
         for (int i = 0; i < n; ++i)
         {
-            const int y = 58 + i * 32;
+            const int y = kRow0 + 2 + i * 32;
             minus[i]->setBounds (96, y, 30, 26);
             noteLbl[i]->setBounds (130, y, 70, 26);
             plus[i]->setBounds (204, y, 30, 26);
             shiftLbl[i]->setBounds (260, y, 100, 26);
         }
-        const int y = 56 + n * 32 + 24;
+        const int y = kRow0 + n * 32 + 24;
         nameEd.setBounds (14, y, getWidth() - 28, 26);
         resetBtn.setBounds (14, y + 32, 80, 26);
         delBtn.setBounds (100, y + 32, 80, 26);
@@ -819,6 +896,13 @@ public:
 
 private:
     void step (int s, int d) { pitches.set (s, jlimit (12, 100, pitches[s] + d)); apply(); }
+
+    void shiftAll (int d)
+    {
+        for (int v : pitches) if (v + d < 12 || v + d > 100) return;
+        for (int i = 0; i < n; ++i) pitches.set (i, pitches[i] + d);
+        apply();
+    }
 
     void apply (bool refresh = true)
     {
@@ -895,9 +979,171 @@ private:
     std::vector<Tuning> all;
     ComboBox presets;
     TextEditor nameEd;
+    TextButton allMinus, allPlus;
     TextButton resetBtn { "Сбросить"_ru }, saveBtn { String::fromUTF8 ("\xe2\x98\x85 Сохранить строй") }, delBtn { "Удалить"_ru };
     OwnedArray<TextButton> minus, plus;
     OwnedArray<Label> noteLbl, shiftLbl;
+};
+
+//==============================================================================
+/** Pop-up for the user's own keys: pick the notes above the tonic, name it, save / change / delete. */
+class ScaleEditor : public Component
+{
+public:
+    ScaleEditor (TabMidiProcessor& p, bool editCurrent, std::function<void()> changed) : proc (p), onChanged (std::move (changed))
+    {
+        Scale cur;
+        {
+            const ScopedLock sl (proc.lock);
+            cur = scaleAt (proc.keyScale);
+            keyRoot = proc.keyRoot;
+        }
+        if (editCurrent && cur.custom) { originalName = cur.name; nameEd.setText (cur.name, dontSendNotification); }
+        else nameEd.setText ("Моя тональность"_ru, dontSendNotification);
+        for (int i : cur.iv) on[(size_t) i] = true;
+        on[0] = true;
+
+        static const char* labels[12] = { "1", "b2", "2", "b3", "3", "4", "b5", "5", "b6", "6", "b7", "7" };
+        for (int i = 0; i < 12; ++i)
+        {
+            auto* b = toggles.add (new TextButton (labels[i]));
+            b->setClickingTogglesState (true);
+            b->setColour (TextButton::buttonOnColourId, col::accent);        // the pop-up has its own look and feel, set the colours here
+            b->setColour (TextButton::textColourOnId, col::bg);
+            b->setToggleState (on[(size_t) i], dontSendNotification);
+            if (i == 0) b->setEnabled (false);
+            b->onClick = [this, i] { toggle (i); };
+            addAndMakeVisible (b);
+        }
+
+        const auto& bank = scales();
+        for (size_t i = 0; i < bank.size(); ++i) basis.addItem (bank[i].name, (int) i + 1);
+        basis.setTextWhenNothingSelected ("Взять за основу готовую…"_ru);
+        basis.onChange = [this]
+        {
+            const int idx = basis.getSelectedId() - 1;
+            if (idx < 0) return;
+            Scale s;
+            { const ScopedLock sl (proc.lock); s = scaleAt (idx); }
+            on.fill (false);
+            for (int i : s.iv) on[(size_t) i] = true;
+            for (int i = 0; i < 12; ++i) toggles[i]->setToggleState (on[(size_t) i], dontSendNotification);
+            repaint();
+        };
+        delBtn.onClick  = [this] { remove(); };
+        saveBtn.onClick = [this] { save(); };
+        saveBtn.setColour (TextButton::buttonColourId, col::accent);
+        saveBtn.setColour (TextButton::textColourOffId, col::bg);
+        delBtn.setEnabled (originalName.isNotEmpty());
+        for (Component* c : std::initializer_list<Component*> { &basis, &nameEd, &saveBtn, &delBtn }) addAndMakeVisible (c);
+        setSize (420, 268);
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (col::panel);
+        g.setColour (col::muted);
+        g.setFont (fnt (11.0f, true));
+        g.drawText (originalName.isNotEmpty() ? "ИЗМЕНИТЬ ТОНАЛЬНОСТЬ"_ru : "НОВАЯ ТОНАЛЬНОСТЬ"_ru, 14, 8, 300, 14, Justification::left, false);
+        g.drawText ("ЗВУКИ НАД ТОНИКОЙ (ПОЛУТОНОВ ОТ ТОНИКИ)"_ru, 14, 94, 392, 14, Justification::left, false);
+
+        StringArray notesList;
+        int count = 0;
+        for (int i = 0; i < 12; ++i)
+            if (on[(size_t) i]) { notesList.add (noteName (keyRoot + i)); ++count; }
+        g.setFont (fnt (12.0f));
+        g.setColour (count >= 3 && count <= 8 ? col::text : Colour (0xffff7b72));
+        g.drawText (count < 3 ? "Нужно хотя бы 3 ноты"_ru : count > 8 ? "Не больше 8 нот"_ru
+                                 : "В тональности "_ru + noteName (keyRoot) + ": " + notesList.joinIntoString (" "),
+                    14, 192, 392, 18, Justification::left, true);
+    }
+
+    void resized() override
+    {
+        basis.setBounds (14, 24, getWidth() - 28, 26);
+        nameEd.setBounds (14, 58, getWidth() - 28, 26);
+        for (int i = 0; i < 12; ++i)
+            toggles[i]->setBounds (14 + (i % 6) * 66, 114 + (i / 6) * 38, 60, 32);
+        delBtn.setBounds (14, 224, 100, 28);
+        saveBtn.setBounds (getWidth() - 14 - 190, 224, 190, 28);
+    }
+
+private:
+    int countOn() const { int c = 0; for (bool b : on) if (b) ++c; return c; }
+
+    void toggle (int i)
+    {
+        if (i == 0) { toggles[0]->setToggleState (true, dontSendNotification); return; }
+        const bool want = toggles[i]->getToggleState();
+        if (want && countOn() >= 8) { toggles[i]->setToggleState (false, dontSendNotification); repaint(); return; }
+        on[(size_t) i] = want;
+        repaint();
+    }
+
+    void save()
+    {
+        std::vector<int> iv;
+        for (int i = 0; i < 12; ++i) if (on[(size_t) i]) iv.push_back (i);
+        if (iv.size() < 3 || iv.size() > 8) return;
+
+        String nm = nameEd.getText().trim();
+        if (nm.isEmpty()) nm = "Моя тональность"_ru;
+        for (int i = 0; i < builtInScaleCount(); ++i)
+            if (scaleAt (i).name.equalsIgnoreCase (nm)) nm << " (моя)"_ru;
+
+        {
+            const ScopedLock sl (proc.lock);
+            auto list = customScales();
+            bool done = false;
+            for (auto& c : list)
+                if (originalName.isNotEmpty() && c.name == originalName) { c.name = nm; c.iv = iv; done = true; break; }
+            if (! done)
+                for (auto& c : list) if (c.name == nm) { c.iv = iv; done = true; break; }
+            if (! done) { Scale s; s.name = nm; s.iv = iv; s.custom = true; list.push_back (s); }
+
+            std::vector<Scale> unique;                     // two keys never share a name
+            for (auto& c : list)
+            {
+                bool dup = false;
+                for (auto& u : unique) if (u.name == c.name) dup = true;
+                if (! dup) unique.push_back (c);
+            }
+            setCustomScales (unique);
+            ScaleStore::save (unique);
+            proc.keyScale = jmax (0, indexOfScale (nm));
+        }
+        originalName = nm;
+        nameEd.setText (nm, dontSendNotification);
+        delBtn.setEnabled (true);
+        repaint();
+        if (onChanged) onChanged();
+    }
+
+    void remove()
+    {
+        if (originalName.isEmpty()) return;
+        {
+            const ScopedLock sl (proc.lock);
+            const String current = scaleAt (proc.keyScale).name;
+            auto list = customScales();
+            list.erase (std::remove_if (list.begin(), list.end(), [this] (const Scale& s) { return s.name == originalName; }), list.end());
+            setCustomScales (list);
+            ScaleStore::save (list);
+            proc.keyScale = jmax (0, indexOfScale (current == originalName ? String ("Minor") : current));
+        }
+        if (onChanged) onChanged();
+        if (auto* cb = findParentComponentOfClass<CallOutBox>()) cb->dismiss();
+    }
+
+    TabMidiProcessor& proc;
+    std::function<void()> onChanged;
+    int keyRoot = 0;
+    String originalName;                       // empty = a new key
+    std::array<bool, 12> on {};
+    ComboBox basis;
+    TextEditor nameEd;
+    TextButton saveBtn { "Сохранить"_ru }, delBtn { "Удалить"_ru };
+    OwnedArray<TextButton> toggles;
 };
 
 //==============================================================================
@@ -965,7 +1211,10 @@ private:
     void openTuningEditor (Component* from);
     void refreshAll();
     void updateTabButtons();
-    void updateChordsButton();
+    void refreshScaleBox();
+    void openScaleEditor (bool editCurrent);
+    int minWidth() const;
+    void updateChordsButton (bool resizeWindow);
 
     TabMidiProcessor& proc;
     TabLnF lnf;
@@ -980,14 +1229,14 @@ private:
     ChordPanel chordPanel;
     TextButton openBtn { "Открыть…"_ru }, makeBtn { "MAKE MIDI" }, saveBtn { "Сохранить .mid…"_ru }, presetBtn { "Standard" };
     ComboBox trackBox, rootBox, scaleBox;
-    OwnedArray<TextButton> barBtns, strBtns, chipBtns, durBtns;
+    OwnedArray<TextButton> barBtns, strBtns, chipBtns, durBtns, viewBtns;
     DragHandle dragHandle;
     TabCanvas canvas;
     Viewport viewport;
     FretboardView fretboard;
 
     Rectangle<int> rDrop, rDrag, rControls, rTab, rFret;
-    int xBars = 0, xStrings = 0, xTuning = 0, xDur = 0;
+    int xBars = 0, xStrings = 0, xTuning = 0, xDur = 0, xView = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TabMidiEditor)
 };

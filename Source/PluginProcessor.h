@@ -36,6 +36,8 @@ public:
     TabScore score;
     int keyRoot = 9;               // A
     int keyScale = 1;              // Minor
+    int viewBars = 4;              // how many bars the tab shows at once (4 / 8 / 16)
+    int editorW = 0, editorH = 0;  // last window size, 0 = default
     bool showChords = true;        // chord helper panel on the right
     int duration = 2;              // default length of a newly typed note, in cells (2 = 1/8)
 

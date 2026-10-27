@@ -20,23 +20,65 @@ inline const char* noteName (int midiOrPc)
 inline String pitchName (int midi) { return String (noteName (midi)) + String (midi / 12 - 1); }
 
 //==============================================================================
-struct Scale { const char* name; std::vector<int> iv; };
-
-inline const std::vector<Scale>& scales()
+struct Scale
 {
-    static const std::vector<Scale> s = {
-        { "Major",         { 0, 2, 4, 5, 7, 9, 11 } },
-        { "Minor",         { 0, 2, 3, 5, 7, 8, 10 } },
-        { "Dorian",        { 0, 2, 3, 5, 7, 9, 10 } },
-        { "Phrygian",      { 0, 1, 3, 5, 7, 8, 10 } },
-        { "Lydian",        { 0, 2, 4, 6, 7, 9, 11 } },
-        { "Mixolydian",    { 0, 2, 4, 5, 7, 9, 10 } },
-        { "Locrian",       { 0, 1, 3, 5, 6, 8, 10 } },
-        { "Harmonic min",  { 0, 2, 3, 5, 7, 8, 11 } },
-        { "Melodic min",   { 0, 2, 3, 5, 7, 9, 11 } },
-        { "Major pent.",   { 0, 2, 4, 7, 9 } },
-        { "Minor pent.",   { 0, 3, 5, 7, 10 } } };
+    String name;
+    std::vector<int> iv;        // semitones above the tonic, ascending, starting with 0
+    bool custom = false;        // made by the user
+};
+
+/** All keys: the built-in ones first, then the user's own (see ScaleStore). Touch it only under TabMidiProcessor::lock. */
+inline std::vector<Scale>& scaleBank()
+{
+    static std::vector<Scale> s = {
+        { "Major",         { 0, 2, 4, 5, 7, 9, 11 }, false },
+        { "Minor",         { 0, 2, 3, 5, 7, 8, 10 }, false },
+        { "Dorian",        { 0, 2, 3, 5, 7, 9, 10 }, false },
+        { "Phrygian",      { 0, 1, 3, 5, 7, 8, 10 }, false },
+        { "Lydian",        { 0, 2, 4, 6, 7, 9, 11 }, false },
+        { "Mixolydian",    { 0, 2, 4, 5, 7, 9, 10 }, false },
+        { "Locrian",       { 0, 1, 3, 5, 6, 8, 10 }, false },
+        { "Harmonic min",  { 0, 2, 3, 5, 7, 8, 11 }, false },
+        { "Melodic min",   { 0, 2, 3, 5, 7, 9, 11 }, false },
+        { "Major pent.",   { 0, 2, 4, 7, 9 }, false },
+        { "Minor pent.",   { 0, 3, 5, 7, 10 }, false } };
     return s;
+}
+
+inline const std::vector<Scale>& scales() { return scaleBank(); }
+inline int builtInScaleCount() { return 11; }
+inline const Scale& scaleAt (int i) { auto& b = scaleBank(); return b[(size_t) jlimit (0, (int) b.size() - 1, i)]; }
+
+inline std::vector<Scale> customScales()
+{
+    auto& b = scaleBank();
+    return std::vector<Scale> (b.begin() + builtInScaleCount(), b.end());
+}
+
+inline void setCustomScales (const std::vector<Scale>& list)
+{
+    auto& b = scaleBank();
+    b.resize ((size_t) builtInScaleCount());
+    for (auto s : list) { s.custom = true; b.push_back (s); }
+}
+
+inline int indexOfScale (const String& name)
+{
+    auto& b = scaleBank();
+    for (size_t i = 0; i < b.size(); ++i) if (b[i].name == name) return (int) i;
+    return -1;
+}
+
+/** Finds a key by name and notes, or adds it (used when a project carries a key this computer does not know). */
+inline int findOrAddScale (const String& name, const std::vector<int>& iv)
+{
+    auto& b = scaleBank();
+    for (size_t i = 0; i < b.size(); ++i) if (b[i].name == name && b[i].iv == iv) return (int) i;
+    for (size_t i = 0; i < b.size(); ++i) if (b[i].iv == iv) return (int) i;
+    Scale s; s.iv = iv; s.custom = true;
+    s.name = indexOfScale (name) >= 0 ? name + " *" : name;
+    b.push_back (s);
+    return (int) b.size() - 1;
 }
 
 /** 1-based degree of a pitch inside the scale, or 0 when the pitch is not in the scale. */
@@ -145,6 +187,65 @@ struct TuningStore
         std::vector<Tuning> all;
         for (auto& t : load()) if (t.pitches.size() == n) all.push_back (t);
         return all;
+    }
+};
+
+
+/** The user's own keys, kept as JSON next to the saved tunings. */
+struct ScaleStore
+{
+    static File file()
+    {
+        return File::getSpecialLocation (File::userApplicationDataDirectory)
+                   .getChildFile ("TabMidi").getChildFile ("scales.json");
+    }
+
+    static std::vector<Scale> load()
+    {
+        std::vector<Scale> out;
+        auto v = JSON::parse (file());
+        if (auto* a = v.getArray())
+            for (auto& item : *a)
+            {
+                Scale s; s.custom = true;
+                s.name = item.getProperty ("name", "").toString();
+                const var iv = item.getProperty ("intervals", {});
+                if (auto* p = iv.getArray())
+                    for (auto& x : *p) s.iv.push_back (jlimit (0, 11, (int) x));
+                if (s.name.isNotEmpty() && s.iv.size() >= 3 && s.iv.size() <= 8 && s.iv.front() == 0)
+                    out.push_back (s);
+            }
+        return out;
+    }
+
+    static void save (const std::vector<Scale>& list)
+    {
+        Array<var> arr;
+        for (auto& sc : list)
+        {
+            auto* o = new DynamicObject();
+            o->setProperty ("name", sc.name);
+            Array<var> iv;
+            for (int v : sc.iv) iv.add (v);
+            o->setProperty ("intervals", iv);
+            arr.add (var (o));
+        }
+        auto f = file();
+        f.getParentDirectory().createDirectory();
+        f.replaceWithText (JSON::toString (var (arr)));
+    }
+
+    /** Adds the saved keys to the bank (keys that came with a project stay). Existing indices do not change. */
+    static void mergeIntoBank()
+    {
+        auto have = customScales();
+        for (auto& s : load())
+        {
+            bool exists = false;
+            for (auto& h : have) if (h.name == s.name) exists = true;
+            if (! exists) have.push_back (s);
+        }
+        setCustomScales (have);
     }
 };
 

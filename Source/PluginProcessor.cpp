@@ -44,6 +44,16 @@ void TabMidiProcessor::getStateInformation (MemoryBlock& dest)
     XmlElement root ("TABMIDI");
     root.setAttribute ("root", keyRoot);
     root.setAttribute ("scale", keyScale);
+    {
+        const auto& sc = scaleAt (keyScale);
+        StringArray ivs;
+        for (int v : sc.iv) ivs.add (String (v));
+        root.setAttribute ("scaleName", sc.name);
+        root.setAttribute ("scaleIv", ivs.joinIntoString (" "));
+    }
+    root.setAttribute ("view", viewBars);
+    root.setAttribute ("ew", editorW);
+    root.setAttribute ("eh", editorH);
     root.setAttribute ("dur", duration);
     root.setAttribute ("chords", showChords ? 1 : 0);
     root.setAttribute ("src", sourceName);
@@ -59,6 +69,15 @@ void TabMidiProcessor::setStateInformation (const void* data, int size)
             const ScopedLock sl (lock);
             keyRoot  = jlimit (0, 11, xml->getIntAttribute ("root", 9));
             keyScale = jlimit (0, (int) scales().size() - 1, xml->getIntAttribute ("scale", 1));
+            if (xml->getStringAttribute ("scaleName").isNotEmpty())
+            {
+                std::vector<int> iv;
+                for (auto& t : StringArray::fromTokens (xml->getStringAttribute ("scaleIv"), " ", "")) iv.push_back (jlimit (0, 11, t.getIntValue()));
+                if (iv.size() >= 3 && iv.front() == 0) keyScale = findOrAddScale (xml->getStringAttribute ("scaleName"), iv);
+            }
+            viewBars = xml->getIntAttribute ("view", 4) == 16 ? 16 : xml->getIntAttribute ("view", 4) == 8 ? 8 : 4;
+            editorW = xml->getIntAttribute ("ew", 0);
+            editorH = xml->getIntAttribute ("eh", 0);
             duration = jlimit (1, 16, xml->getIntAttribute ("dur", 2));
             showChords = xml->getIntAttribute ("chords", 1) != 0;
             sourceName = xml->getStringAttribute ("src");

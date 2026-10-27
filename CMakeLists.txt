@@ -16,7 +16,9 @@ set(TABMIDI_CORE Source/TabModel.cpp Source/GpxImporter.cpp)
 # ---- the plugin -------------------------------------------------------------
 if(NOT TABMIDI_TESTS_ONLY)
 juce_add_plugin(TabMidi
-    COMPANY_NAME "TabMidi"
+    COMPANY_NAME "desNotto"
+    COMPANY_COPYRIGHT "desNotto"
+    BUNDLE_ID com.desNotto.TabMidi
     PLUGIN_MANUFACTURER_CODE Tbmd
     PLUGIN_CODE Tbmi
     FORMATS VST3 Standalone

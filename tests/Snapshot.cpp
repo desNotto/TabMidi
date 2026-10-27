@@ -71,7 +71,7 @@ static void behaviourTests()
     std::printf ("      last message: %s\n", lastInfo.toRawUTF8());
 
     // chord table: which chords of E minor are "in key" (compare with the reference chart)
-    const auto& sc = scales()[1];
+    const auto& sc = scaleAt (1);
     String inKey;
     for (int r : { 0, 1, 2, 3 })
         for (int c = 0; c < 7; ++c)
@@ -85,10 +85,76 @@ static void behaviourTests()
     CHECK (! chordInScale (4, chordTypes()[0], 4, sc));                            // Emaj is not
 }
 
+static void click (TextButton* b) { if (b != nullptr && b->onClick) b->onClick(); else std::printf ("      (no button or handler)\n"); }
+
+static TextButton* findButton (Component& c, const String& text, int skip = 0)
+{
+    for (auto* ch : c.getChildren())
+        if (auto* b = dynamic_cast<TextButton*> (ch))
+            if (b->getButtonText() == text && skip-- == 0) return b;
+    return nullptr;
+}
+
+static void scaleAndTuningTests()
+{
+    ScaleStore::file().deleteFile();
+    TabMidiProcessor p;
+    int changes = 0;
+
+    {   // create a key from the current one (A minor): add the major 7th -> harmonic minor shape
+        ScaleEditor ed (p, false, [&changes] { ++changes; });
+        findButton (ed, "7")->setToggleState (true, dontSendNotification);
+        click (findButton (ed, "7"));                                      // the click handler reads the toggle state
+        for (auto* ch : ed.getChildren())
+            if (auto* te = dynamic_cast<TextEditor*> (ch)) te->setText ("Test key", dontSendNotification);
+        click (findButton (ed, String::fromUTF8 ("Сохранить")));
+        const int idx = indexOfScale ("Test key");
+        CHECK (idx >= builtInScaleCount() && p.keyScale == idx);
+        CHECK (scaleAt (idx).iv.size() >= 7 && changes == 1);
+        CHECK (ScaleStore::load().size() == 1);
+    }
+    {   // edit it: rename and drop a note
+        ScaleEditor ed (p, true, [&changes] { ++changes; });
+        for (auto* ch : ed.getChildren())
+            if (auto* te = dynamic_cast<TextEditor*> (ch)) te->setText ("Test key 2", dontSendNotification);
+        click (findButton (ed, String::fromUTF8 ("Сохранить")));
+        CHECK (indexOfScale ("Test key") < 0 && indexOfScale ("Test key 2") >= 0);
+        CHECK (customScales().size() == 1 && ScaleStore::load().size() == 1);
+    }
+    {   // a project that carries the key restores it, even when this computer does not know it
+        MemoryBlock mb; p.getStateInformation (mb);
+        const auto iv = scaleAt (p.keyScale).iv;
+        setCustomScales ({});                                                      // pretend a different computer
+        TabMidiProcessor q; q.setStateInformation (mb.getData(), (int) mb.getSize());
+        CHECK (scaleAt (q.keyScale).name == "Test key 2" && scaleAt (q.keyScale).iv == iv);
+        setCustomScales (ScaleStore::load());
+        p.keyScale = indexOfScale ("Test key 2");
+    }
+    {   // delete it
+        ScaleEditor ed (p, true, [&changes] { ++changes; });
+        click (findButton (ed, String::fromUTF8 ("Удалить")));
+        CHECK (customScales().empty() && ScaleStore::load().empty());
+        CHECK (scaleAt (p.keyScale).name == "Minor");
+    }
+
+    {   // whole-tuning buttons move every string by a semitone
+        TuningEditor te (p, nullptr);
+        const auto before = p.score.tuning;
+        click (findButton (te, "+", 0));                                   // first "+" is the whole-tuning one
+        bool allUp = true; for (int i = 0; i < before.size(); ++i) allUp = allUp && p.score.tuning[i] == before[i] + 1;
+        CHECK (allUp);
+        click (findButton (te, String::fromUTF8 ("\xe2\x88\x92"), 0));
+        click (findButton (te, String::fromUTF8 ("\xe2\x88\x92"), 0));
+        bool allDown = true; for (int i = 0; i < before.size(); ++i) allDown = allDown && p.score.tuning[i] == before[i] - 1;
+        CHECK (allDown);
+    }
+}
+
 int main (int argc, char** argv)
 {
     ScopedJuceInitialiser_GUI init;
     behaviourTests();
+    scaleAndTuningTests();
     String out = argc > 1 ? argv[1] : "/tmp/snap";
     File (out).createDirectory();
 
@@ -127,6 +193,27 @@ int main (int argc, char** argv)
         if (auto* cv = findCanvas (*ed)) cv->select (8, 5);
         snap (*ed, out + "/9_back_to_key.png");
     }
+    {   // 10. bigger window, 16 bars shown at once, a custom key, 24-fret neck
+        ScaleStore::file().deleteFile();
+        TabMidiProcessor p;
+        p.score.reset (16, 7, builtInTunings (7)[0].pitches, "Standard");
+        p.keyRoot = 9; p.viewBars = 16; p.duration = 2;
+        {
+            const ScopedLock sl (p.lock);
+            Scale sc; sc.name = String::fromUTF8 ("Моя пентатоника"); sc.iv = { 0, 3, 5, 6, 7, 10 }; sc.custom = true;     // blues scale
+            setCustomScales ({ sc });
+            p.keyScale = indexOfScale (sc.name);
+        }
+        for (int b = 0; b < 16; ++b)
+            for (int i = 0; i < 16; i += 2)
+                if ((b + i) % 3 != 1) { auto& c = p.score.cells[(size_t) (b * 16 + i)]; c.fret[b % 4] = (i / 2 + b) % 9; c.len[b % 4] = 2; }
+        std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
+        ed->setSize (1800, 1000);
+        snap (*ed, out + "/10_big_16bars.png");
+        ed->setSize (1546, 724);
+        snap (*ed, out + "/11_min_size.png");
+        ScaleStore::file().deleteFile();
+    }
     {   // 5. 9-string C major with four chords, the Am chord selected (outline on the fretboard)
         TabMidiProcessor p;
         p.score.reset (4, 9, builtInTunings (9)[0].pitches, "Standard");
@@ -162,6 +249,9 @@ int main (int argc, char** argv)
         snap (*ed, out + "/3_dorian_7str.png");
         TuningEditor te (b, nullptr);
         snap (te, out + "/4_tuning.png");
+        b.keyRoot = 4; b.keyScale = 1;
+        ScaleEditor se (b, false, nullptr);
+        snap (se, out + "/12_scale_editor.png");
     }
     return 0;
 }

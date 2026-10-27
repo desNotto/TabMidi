@@ -4,15 +4,17 @@ namespace tabmidi
 {
 static const int kDurations[] = { 16, 8, 4, 2, 1 };          // whole, half, quarter, eighth, sixteenth (in cells)
 static const char* kDurLabels[] = { "1", "1/2", "1/4", "1/8", "1/16" };
-static const int kMainW = 1040, kPanelW = 490, kWideW = kMainW + kPanelW + 16;
+static const int kMainW = 1040, kPanelW = 490, kWideW = kMainW + kPanelW + 16, kMinH = 724;
 static const char* kDurNames[]  = { "ЦЕЛАЯ", "ПОЛОВИНА", "ЧЕТВЕРТЬ", "ВОСЬМАЯ", "ШЕСТНАДЦАТАЯ" };
 
 TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     : AudioProcessorEditor (&p), proc (p), canvas (p), fretboard (p, canvas), chordPanel (p)
 {
     setLookAndFeel (&lnf);
-    setSize (p.showChords ? kWideW : kMainW, 724);
-    setResizable (false, false);
+    setResizable (true, true);                                      // the layout follows the window size
+    setResizeLimits (minWidth(), kMinH, 3200, 1800);
+    setSize (jlimit (minWidth(), 3200, p.editorW > 0 ? p.editorW : minWidth()),
+             jlimit (kMinH, 1800, p.editorH > 0 ? p.editorH : kMinH));
 
     for (auto* b : { &openBtn, &makeBtn, &saveBtn, &presetBtn }) addAndMakeVisible (b);
     for (auto* b : { &copyBtn, &pasteBtn, &delBarBtn, &undoBtn, &chordsBtn }) addAndMakeVisible (b);
@@ -24,7 +26,7 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     chordsBtn.onClick = [this]
     {
         { const ScopedLock sl (proc.lock); proc.showChords = ! proc.showChords; }
-        updateChordsButton();
+        updateChordsButton (true);
     };
     chordPanel.onToggle = [this] (int root, int type)
     {
@@ -71,9 +73,15 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     }
 
     for (int i = 0; i < 12; ++i) rootBox.addItem (noteName (i), i + 1);
-    for (size_t i = 0; i < scales().size(); ++i) scaleBox.addItem (scales()[i].name, (int) i + 1);
+    { const ScopedLock sl (proc.lock); ScaleStore::mergeIntoBank(); }       // keys saved earlier join the list
     rootBox.onChange = [this] { { const ScopedLock sl (proc.lock); proc.keyRoot = rootBox.getSelectedId() - 1; } chordPanel.clearSelection(); fretboard.clearChord(); repaint(); };
-    scaleBox.onChange = [this] { { const ScopedLock sl (proc.lock); proc.keyScale = scaleBox.getSelectedId() - 1; } chordPanel.clearSelection(); fretboard.clearChord(); repaint(); };
+    scaleBox.onChange = [this]
+    {
+        const int id = scaleBox.getSelectedId();
+        if (id == 1000 || id == 1001) { refreshScaleBox(); openScaleEditor (id == 1001); return; }
+        { const ScopedLock sl (proc.lock); proc.keyScale = id >= 101 ? builtInScaleCount() + (id - 101) : id - 1; }
+        chordPanel.clearSelection(); fretboard.clearChord(); repaint();
+    };
     for (int i = 0; i < 5; ++i)
     {
         auto* b = durBtns.add (new TextButton (kDurLabels[i]));
@@ -84,6 +92,20 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
             { const ScopedLock sl (proc.lock); proc.duration = kDurations[i]; }
             canvas.applyDurationToSelection();
             repaint();
+        };
+        addAndMakeVisible (b);
+    }
+    for (int v : { 4, 8, 16 })                                      // bars visible at once
+    {
+        auto* b = viewBtns.add (new TextButton (String (v)));
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (104);
+        b->onClick = [this, v]
+        {
+            { const ScopedLock sl (proc.lock); proc.viewBars = v; }
+            canvas.refreshSize();
+            viewport.setViewPosition (jmax (0, (int) (TabCanvas::x0 + (float) canvas.selCell * canvas.cellW) - 80), 0);
+            canvas.repaint();
         };
         addAndMakeVisible (b);
     }
@@ -99,7 +121,7 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     {
         fretboard.repaint();
         updateTabButtons();
-        if (dragHandle.ready()) { dragHandle.setFile ({}); midiStatus = "Таб изменён: нажмите MAKE MIDI ещё раз"_ru; repaint(); }
+        if (dragHandle.ready()) { dragHandle.setFile ({}); midiStatus = "Таб изменён: нажмите MAKE MIDI"_ru; repaint(); }
     };
     canvas.onSelection = [this]
     {
@@ -119,7 +141,7 @@ TabMidiEditor::TabMidiEditor (TabMidiProcessor& p)
     canvas.onInfo = [this] (const String& m) { midiStatus = m; repaint(); };
     fretboard.onPick = [this] (int s, int f) { canvas.toggleNote (s, f); canvas.grabKeyboardFocus(); };
 
-    updateChordsButton();
+    updateChordsButton (false);
     resized();
     refreshAll();
 }
@@ -193,7 +215,7 @@ void TabMidiEditor::importTrack (int index)
 void TabMidiEditor::makeMidi()
 {
     const auto f = proc.makeMidiFile();
-    if (f.existsAsFile()) { dragHandle.setFile (f); midiStatus = f.getFileName() + " готов: перетащите его в DAW"_ru; }
+    if (f.existsAsFile()) { dragHandle.setFile (f); midiStatus = f.getFileName() + " готов, тяните в DAW"_ru; }
     else midiStatus = "Не удалось записать MIDI-файл"_ru;
     repaint();
 }
@@ -203,7 +225,7 @@ void TabMidiEditor::saveMidiAs()
     const auto src = proc.makeMidiFile();
     if (! src.existsAsFile()) return;
     dragHandle.setFile (src);
-    midiStatus = src.getFileName() + " готов: перетащите его в DAW"_ru;
+    midiStatus = src.getFileName() + " готов, тяните в DAW"_ru;
     repaint();
 
     chooser = std::make_unique<FileChooser> ("Сохранить MIDI"_ru, File::getSpecialLocation (File::userDocumentsDirectory).getChildFile (src.getFileName()), "*.mid");
@@ -292,13 +314,58 @@ void TabMidiEditor::updateTabButtons()
     undoBtn.setEnabled (canvas.canUndo());
 }
 
-void TabMidiEditor::updateChordsButton()
+void TabMidiEditor::updateChordsButton (bool resizeWindow)
 {
     bool show;
     { const ScopedLock sl (proc.lock); show = proc.showChords; }
     chordsBtn.setButtonText ("Аккорды "_ru + String::fromUTF8 (show ? "\xe2\x97\x84" : "\xe2\x96\xba"));
     chordPanel.setVisible (show);
-    setSize (show ? kWideW : kMainW, 724);
+    setResizeLimits (minWidth(), kMinH, 3200, 1800);
+    if (resizeWindow)
+    {
+        const int w = jlimit (minWidth(), 3200, getWidth() + (show ? kPanelW + 16 : -(kPanelW + 16)));
+        if (w != getWidth()) setSize (w, getHeight()); else resized();
+    }
+}
+
+int TabMidiEditor::minWidth() const
+{
+    const ScopedLock sl (proc.lock);
+    return proc.showChords ? kWideW : kMainW;
+}
+
+void TabMidiEditor::refreshScaleBox()
+{
+    int cur;
+    std::vector<Scale> bank;
+    { const ScopedLock sl (proc.lock); cur = proc.keyScale; bank = scales(); }
+    const int nb = builtInScaleCount();
+    scaleBox.clear (dontSendNotification);
+    for (int i = 0; i < nb; ++i) scaleBox.addItem (bank[(size_t) i].name, i + 1);
+    if ((int) bank.size() > nb)
+    {
+        scaleBox.addSeparator();
+        scaleBox.addSectionHeading ("Мои тональности"_ru);
+        for (size_t i = (size_t) nb; i < bank.size(); ++i) scaleBox.addItem (bank[i].name, 101 + (int) i - nb);
+    }
+    scaleBox.addSeparator();
+    scaleBox.addItem ("+ Новая тональность…"_ru, 1000);
+    scaleBox.addItem ("Изменить выбранную…"_ru, 1001);
+    scaleBox.setItemEnabled (1001, cur >= nb);
+    scaleBox.setSelectedId (cur >= nb ? 101 + cur - nb : cur + 1, dontSendNotification);
+}
+
+void TabMidiEditor::openScaleEditor (bool editCurrent)
+{
+    Component::SafePointer<TabMidiEditor> safe (this);
+    auto content = std::make_unique<ScaleEditor> (proc, editCurrent, [safe]
+    {
+        if (safe == nullptr) return;
+        safe->chordPanel.clearSelection();
+        safe->fretboard.clearChord();
+        safe->refreshAll();
+    });
+    CallOutBox::launchAsynchronously (std::move (content), scaleBox.getScreenBounds(), nullptr);
 }
 
 void TabMidiEditor::refreshAll()
@@ -323,6 +390,9 @@ void TabMidiEditor::refreshAll()
     rootBox.setSelectedId (root + 1, dontSendNotification);
     scaleBox.setSelectedId (scale + 1, dontSendNotification);
     for (int i = 0; i < 5; ++i) durBtns[i]->setToggleState (kDurations[i] == dur, dontSendNotification);
+    { int k2 = 0; for (int v : { 4, 8, 16 }) viewBtns[k2++]->setToggleState (proc.viewBars == v, dontSendNotification); }
+    refreshScaleBox();
+    chordPanel.repaint();
     canvas.refreshSize();
     canvas.repaint();
     fretboard.repaint();
@@ -334,17 +404,23 @@ void TabMidiEditor::refreshAll()
 void TabMidiEditor::resized()
 {
     const int pad = 16, gap = 12;
-    rDrop = { pad, pad, 594, 72 };
-    makeBtn.setBounds (rDrop.getRight() + gap, pad, 180, 72);
-    rDrag = { makeBtn.getRight() + gap, pad, kMainW - pad - (makeBtn.getRight() + gap), 72 };
+    const int W = getWidth(), H = getHeight();
+    bool showPanel;
+    { const ScopedLock sl (proc.lock); showPanel = proc.showChords; proc.editorW = W; proc.editorH = H; }
+    const int mainW = showPanel ? W - kPanelW - 16 : W;                // main area is [0, mainW], the chord panel sits to its right
+    const int right = mainW - pad;
+
+    rDrag = { right - 210, pad, 210, 72 };
+    makeBtn.setBounds (rDrag.getX() - gap - 180, pad, 180, 72);
+    rDrop = { pad, pad, makeBtn.getX() - gap - pad, 72 };
     dragHandle.setBounds (rDrag.getX() + 8, rDrag.getY() + 7, rDrag.getWidth() - 16, 36);
     saveBtn.setBounds (rDrag.getX() + 8, rDrag.getY() + 47, rDrag.getWidth() - 16, 20);
     openBtn.setBounds (rDrop.getRight() - 12 - 100, rDrop.getY() + 22, 100, 28);
     trackBox.setBounds (openBtn.getX() - 8 - 190, rDrop.getY() + 22, 190, 28);
 
-    rControls = { pad, 100, kMainW - 2 * pad, 72 };
-    rTab = { pad, 184, kMainW - 2 * pad, 216 };
-    rFret = { pad, 412, kMainW - 2 * pad, 296 };
+    rControls = { pad, 100, mainW - 2 * pad, 72 };
+    rTab = { pad, 184, mainW - 2 * pad, 216 };
+    rFret = { pad, 412, mainW - 2 * pad, jmax (296, H - 412 - pad) };   // extra window height goes to the fretboard
 
     const int cy = rControls.getY() + 30;
     int x = rControls.getX() + 16;
@@ -363,8 +439,10 @@ void TabMidiEditor::resized()
         for (int i = 0; i < durBtns.size(); ++i) { durBtns[i]->setBounds (dx, cy, w[i], 32); dx += w[i] + 3; }
     }
     rootBox.setBounds (rFret.getX() + 14, rFret.getY() + 6, 62, 28);          // key picker sits above the fretboard
-    scaleBox.setBounds (rFret.getX() + 82, rFret.getY() + 6, 130, 28);
+    scaleBox.setBounds (rFret.getX() + 82, rFret.getY() + 6, 170, 28);
 
+    xView = rTab.getX() + 150;
+    for (int i = 0; i < viewBtns.size(); ++i) viewBtns[i]->setBounds (xView + 104 + i * 38, rTab.getY() + 7, 34, 24);
     {
         const int bw[] = { 100, 84, 100, 88 };
         Button* arr[] = { &copyBtn, &pasteBtn, &delBarBtn, &undoBtn };
@@ -372,10 +450,11 @@ void TabMidiEditor::resized()
         for (int i = 3; i >= 0; --i) { bx -= bw[i]; arr[i]->setBounds (bx, rTab.getY() + 7, bw[i], 24); bx -= 6; }
     }
     chordsBtn.setBounds (rFret.getRight() - 14 - 120, rFret.getY() + 6, 120, 28);
-    chordPanel.setBounds (kMainW, pad, kPanelW, getHeight() - 2 * pad);
+    chordPanel.setBounds (mainW, pad, kPanelW, H - 2 * pad);
 
     viewport.setBounds (rTab.reduced (8, 0).withTrimmedTop (36).withTrimmedBottom (8));
     fretboard.setBounds (rFret.reduced (10, 0).withTrimmedTop (38).withTrimmedBottom (8));
+    canvas.refreshSize();                                                       // bar width depends on the window width
 }
 
 void TabMidiEditor::paint (Graphics& g)
@@ -432,10 +511,11 @@ void TabMidiEditor::paint (Graphics& g)
     { const ScopedLock sl (proc.lock); bars = proc.score.numBars(); root = proc.keyRoot; scale = proc.keyScale; }
     label ("ТАБ · "_ru + String (bars) + " " + (bars % 10 == 1 && bars != 11 ? "ТАКТ"_ru : (bars % 10 >= 2 && bars % 10 <= 4 && (bars < 10 || bars > 20)) ? "ТАКТА"_ru : "ТАКТОВ"_ru),
            rTab.getX() + 14, rTab.getY() + 12, 160);
+    label ("ВИДНО ТАКТОВ"_ru, xView, rTab.getY() + 12, 100);
     g.setFont (fnt (12.0f));
     g.setColour (midiStatus.isNotEmpty() ? col::accent : col::muted);
-    g.drawText (midiStatus.isNotEmpty() ? midiStatus : String ("Клик по ячейке · цифры = лад · клик по номеру такта = выделить такт"_ru),
-                rTab.getX() + 150, rTab.getY() + 9, rTab.getWidth() - 150 - 14 - 396, 20, Justification::left, true);
+    g.drawText (midiStatus.isNotEmpty() ? midiStatus : String ("Клик по номеру такта: выделить такт"_ru),
+                xView + 104 + 3 * 38 + 10, rTab.getY() + 9, copyBtn.getX() - 8 - (xView + 104 + 3 * 38 + 10), 20, Justification::left, true);
 
     // fretboard panel
     panel (rFret);
