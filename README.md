@@ -15,14 +15,21 @@ VST3-плагин для гитариста: быстро записать ил�
    * вкладка **Actions → set up a workflow yourself**: откроется редактор, вставьте в него весь текст из файла `workflow-build.yml` и нажмите *Commit changes*;
    * или *Add file → Create new file*, в поле имени наберите `.github/workflows/build.yml` (слэши создают папки), вставьте тот же текст и нажмите *Commit changes*.
    Если репозиторий уже создан: загрузите файлы поверх (файлы с теми же именами заменятся), а файл сборки обновите вручную: откройте `.github/workflows/build.yml` → значок карандаша → вставьте текст из `workflow-build.yml` → *Commit changes*.
-3. Сборка (только Windows) стартует сама после коммита или вручную: *Actions → Build VST3 (Windows) → Run workflow*. Через ~10 минут внизу страницы запуска появятся **Artifacts**:
+3. Сборка стартует сама после коммита или вручную: *Actions → Build VST3 (Windows + macOS) → Run workflow*. Windows и macOS собираются параллельно, через ~10–15 минут внизу страницы запуска появятся **Artifacts**:
    * `TabMidi-VST3-Windows` — папка `TabMidi.vst3`;
-   * `TabMidi-Standalone-Windows` — отдельная программа для проверки без DAW.
-4. Положите папку `TabMidi.vst3` в `C:\Program Files\Common Files\VST3\` и пересканируйте плагины в DAW.
+   * `TabMidi-Standalone-Windows` — отдельная программа для проверки без DAW;
+   * `TabMidi-VST3-macOS` — архив `TabMidi-VST3-macOS.zip` с плагином (универсальная сборка: Apple Silicon и Intel, macOS 10.13 и новее);
+   * `TabMidi-Standalone-macOS` — отдельное приложение для Mac.
+4. **Windows:** положите папку `TabMidi.vst3` в `C:\Program Files\Common Files\VST3\` и пересканируйте плагины в DAW.
+5. **macOS:** распакуйте `TabMidi-VST3-macOS.zip` и положите `TabMidi.vst3` в `~/Library/Audio/Plug-Ins/VST3/` (для всех пользователей: `/Library/Audio/Plug-Ins/VST3/`). Плагин подписан только «ad hoc» (без платного аккаунта Apple Developer), поэтому после скачивания macOS блокирует его. Снимите блокировку в Терминале и пересканируйте плагины в DAW:
+   ```
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/TabMidi.vst3
+   ```
+   То же для отдельного приложения: `xattr -dr com.apple.quarantine /путь/к/TabMidi.app`.
 
 ### Локальная сборка
 
-Нужны CMake ≥ 3.22 и Visual Studio 2022 (или Xcode / gcc). JUCE скачивается автоматически.
+Нужны CMake ≥ 3.22 и компилятор C++17: Visual Studio 2022 (Windows), Xcode (macOS) или gcc / clang (Linux). JUCE скачивается автоматически.
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -62,7 +69,7 @@ cmake --build build --config Release --target TabMidi_VST3
   * Режим «Одним файлом»: один `.mid` с отдельной MIDI-дорожкой и отдельным каналом на каждую дорожку Guitar Pro; ударные на канале 10.
   * Кнопка «Раздельно / Одним файлом» переключает режим; если файлы уже созданы, они пересоздаются.
   * Кнопка «Сохранить…» кладёт результат в выбранное место (в раздельном режиме выбирается папка для всех файлов) — на случай, если ваш DAW не принимает перетаскивание из окна плагина.
-* Файлы создаются в папке `Temp\TabMidi\export`; при каждом новом MAKE MIDI она очищается.
+* Файлы создаются в папке `Temp\TabMidi\export` (на macOS во временной папке системы); при каждом новом MAKE MIDI она очищается.
 * Для табулатуры, написанной вручную, получается один `.mid`.
 
 ---
@@ -139,6 +146,8 @@ cmake --build build --config Release --target TabMidi_VST3
 | Очистить выделенное | `Delete` при выделении |
 | Отменить | `Ctrl+Z` |
 
+На macOS вместо `Ctrl` работает `Cmd`.
+
 Если ваш DAW перехватывает клавиши, всё можно делать мышью: ноты вводятся кликом по грифу, а с выделением работают кнопки над табом.
 
 ---
@@ -146,7 +155,7 @@ cmake --build build --config Release --target TabMidi_VST3
 ## 10. Что где хранится
 
 * **В проекте DAW**: табулатура, строй, тональность, длительность по умолчанию, «видно тактов», размер окна, выбранная тональность вместе с её нотами. Импортированные дорожки, кроме открытой в редакторе, в проект не сохраняются: после повторного открытия проекта MAKE MIDI выдаст только то, что в табе.
-* **В папке пользователя** (`%APPDATA%\TabMidi\`): `tunings.json` (свои строи), `scales.json` (свои тональности), `presets.json` (свои пресеты).
+* **В папке пользователя** (`%APPDATA%\TabMidi\` (на macOS `~/Library/Application Support/TabMidi/`)): `tunings.json` (свои строи), `scales.json` (свои тональности), `presets.json` (свои пресеты).
 * **Во временной папке**: `Temp\TabMidi\export` — последние созданные `.mid`.
 
 ---

@@ -1,8 +1,8 @@
-# Файл сборки для GitHub Actions (только Windows).
-# В репозитории он должен лежать по пути .github/workflows/build.yml (см. README: «Как собрать VST3»).
+# Файл сборки для GitHub Actions (Windows и macOS).
+# В репозитории он должен лежать по пути .github/workflows/build.yml (см. README: «Как получить плагин»).
 # Папка .github при загрузке через браузер пропадает, поэтому файл создаётся/обновляется вручную в редакторе GitHub.
 
-name: Build VST3 (Windows)
+name: Build VST3 (Windows + macOS)
 
 on:
   push:
@@ -29,3 +29,31 @@ jobs:
         with:
           name: TabMidi-Standalone-Windows
           path: build/TabMidi_artefacts/Release/Standalone
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (universal build for Apple Silicon and Intel)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+      - name: Build
+        run: cmake --build build --config Release --target TabMidi_VST3 TabMidi_Standalone --parallel
+      - name: Sign (ad hoc) and pack
+        # Apple Silicon refuses to load unsigned code; an ad hoc signature is enough for personal use.
+        # ditto keeps file permissions, which a plain artifact zip would lose.
+        run: |
+          cd build/TabMidi_artefacts/Release
+          codesign --force --deep --sign - VST3/TabMidi.vst3
+          codesign --force --deep --sign - Standalone/TabMidi.app
+          ditto -c -k --sequesterRsrc --keepParent VST3/TabMidi.vst3 TabMidi-VST3-macOS.zip
+          ditto -c -k --sequesterRsrc --keepParent Standalone/TabMidi.app TabMidi-Standalone-macOS.zip
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabMidi-VST3-macOS
+          path: build/TabMidi_artefacts/Release/TabMidi-VST3-macOS.zip
+      - name: Upload standalone app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TabMidi-Standalone-macOS
+          path: build/TabMidi_artefacts/Release/TabMidi-Standalone-macOS.zip
