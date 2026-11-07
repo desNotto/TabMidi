@@ -199,6 +199,94 @@ static void gpExportAndGridTests (const String& gpPath)
     }
 }
 
+static void chordAndPresetTests()
+{
+    auto an = [] (std::initializer_list<int> p) { return analysePitches (std::vector<int> (p)); };
+    auto hasAlt = [] (const ChordAnalysis& a, const String& n) { return std::find (a.alternatives.begin(), a.alternatives.end(), n) != a.alternatives.end(); };
+
+    // ---- intervals first, then chords
+    CHECK (an ({ 40, 43 }).isInterval && an ({ 40, 43 }).shortName == "м3"_ru && an ({ 40, 43 }).longName == "Малая терция"_ru);
+    CHECK (an ({ 40, 44 }).shortName == "б3"_ru);
+    CHECK (an ({ 40, 47 }).shortName == "ч5"_ru && hasAlt (an ({ 40, 47 }), "E5"));
+    CHECK (an ({ 47, 52 }).shortName == "ч4"_ru && hasAlt (an ({ 47, 52 }), "E5/B"));
+    CHECK (an ({ 40, 47, 52 }).shortName == "ч5"_ru);                                        // E B E: still a fifth
+    CHECK (an ({ 40, 43, 47 }).shortName == "Em" && an ({ 40, 43, 47 }).longName == "Emin" && an ({ 40, 43, 47 }).inversion.isEmpty());
+    const auto em7 = an ({ 40, 43, 47, 50 });
+    CHECK (em7.shortName == "Em7" && hasAlt (em7, "G6/E"));
+    CHECK (an ({ 43, 47, 50, 52 }).shortName == "G6" && hasAlt (an ({ 43, 47, 50, 52 }), "Emin7/G"));
+    const auto c6 = an ({ 48, 52, 57 });                                                       // C E A with C in the bass
+    CHECK (c6.shortName == "Am/C" && c6.inversion == "1-я инверсия"_ru && hasAlt (c6, "C6 no5"));
+    CHECK (an ({ 52, 55, 60 }).shortName == "C/E");
+    CHECK (an ({ 48, 51, 54, 57 }).shortName == "Cdim7" && an ({ 48, 51, 54, 57 }).alternatives.size() == 3);
+    CHECK (an ({ 40, 44, 47, 50, 55 }).shortName == "E7#9");                                  // the "Hendrix chord"
+    CHECK (an ({ 40, 47, 50, 54, 59 }).known);                                               // E B D F# B: E9 without the 3rd... is something
+    CHECK (! an ({ 40, 41, 42 }).known && an ({ 40, 41, 42 }).noteCount == 3);
+    CHECK (em7.degrees.size() == 4 && em7.degrees[1] == flatSign() + "3" && em7.degrees[3] == flatSign() + "7");
+    const auto panelEm7 = analyseChordType (4, chordTypes()[6]);
+    CHECK (panelEm7.longName == "Emin7" && panelEm7.noteNames == std::vector<String> ({ "E", "G", "B", "D" }) && hasAlt (panelEm7, "G6/E"));
+    std::printf ("      Em7 -> %s (%s) %s\n", em7.longName.toRawUTF8(), em7.alternatives[0].toRawUTF8(), String (em7.degrees.size()).toRawUTF8());
+
+    // ---- presets: save, overwrite after confirmation, rename, delete, factory names are protected
+    PresetStore::file().deleteFile();
+    TabMidiProcessor p;
+    Preset snap;
+    snap.tuning = p.score.tuning; snap.tuningName = p.score.tuningName; snap.keyRoot = p.keyRoot;
+    snap.scaleName = scaleAt (p.keyScale).name; snap.scaleIv = scaleAt (p.keyScale).iv;
+    auto setName = [] (Component& d, const String& t) { for (auto* ch : d.getChildren()) if (auto* te = dynamic_cast<TextEditor*> (ch)) te->setText (t, dontSendNotification); };
+    const String saveTxt = String::fromUTF8 ("Сохранить"), overTxt = String::fromUTF8 ("Перезаписать");
+
+    CHECK (factoryPresets().size() == 2 && factoryPresets()[0].name == "8 Strings - Drop E - E minor" && factoryPresets()[1].name == "9 Strings - Drop B - B minor");
+    CHECK (factoryPresets()[1].tuning.size() == 9 && factoryPresets()[1].keyRoot == 11 && factoryPresets()[1].tuningName == "Drop B");
+    {
+        PresetDialog d (PresetDialog::Mode::Save, snap, {}, nullptr);
+        setName (d, "My preset"); click (findButton (d, saveTxt));
+        CHECK (PresetStore::load().size() == 1 && PresetStore::load()[0].name == "My preset");
+    }
+    {
+        Preset other = snap; other.tuning = builtInTunings (8)[0].pitches; other.tuningName = "Standard";
+        PresetDialog d (PresetDialog::Mode::Save, other, {}, nullptr);
+        setName (d, "my PRESET"); click (findButton (d, saveTxt));
+        CHECK (PresetStore::load()[0].tuningName == "Drop E");                                // nothing changed yet: it asks first
+        CHECK (findButton (d, overTxt) != nullptr);
+        click (findButton (d, overTxt));
+        CHECK (PresetStore::load().size() == 1 && PresetStore::load()[0].tuningName == "Standard" && PresetStore::load()[0].name == "my PRESET");
+    }
+    {
+        PresetDialog d (PresetDialog::Mode::Save, snap, {}, nullptr);
+        setName (d, "8 strings - drop e - e minor"); click (findButton (d, saveTxt));
+        CHECK (PresetStore::load().size() == 1);                                              // factory names cannot be taken
+    }
+    {
+        PresetDialog d (PresetDialog::Mode::Rename, snap, "my PRESET", nullptr);
+        setName (d, "Renamed"); click (findButton (d, String::fromUTF8 ("Переименовать")));
+        CHECK (PresetStore::load().size() == 1 && PresetStore::load()[0].name == "Renamed" && PresetStore::load()[0].tuningName == "Standard");
+    }
+    {
+        PresetDialog d (PresetDialog::Mode::Save, snap, {}, nullptr);
+        setName (d, "Other"); click (findButton (d, saveTxt));
+        PresetDialog r (PresetDialog::Mode::Rename, snap, "Renamed", nullptr);
+        setName (r, "Other"); click (findButton (r, String::fromUTF8 ("Переименовать"))); click (findButton (r, overTxt));
+        CHECK (PresetStore::load().size() == 1 && PresetStore::load()[0].name == "Other" && PresetStore::load()[0].tuningName == "Standard");
+    }
+    {
+        PresetDialog d (PresetDialog::Mode::Delete, snap, "Other", nullptr);
+        click (findButton (d, String::fromUTF8 ("Удалить")));
+        CHECK (PresetStore::load().empty());
+    }
+    {   // picking a factory preset in the editor
+        TabMidiProcessor q;
+        std::unique_ptr<AudioProcessorEditor> ed (q.createEditor());
+        ComboBox* box = nullptr;
+        for (auto* ch : ed->getChildren())
+            if (auto* cb = dynamic_cast<ComboBox*> (ch))
+                if (cb->indexOfItemId (2) >= 0 && cb->getItemText (cb->indexOfItemId (2)) == "9 Strings - Drop B - B minor") box = cb;
+        CHECK (box != nullptr);
+        if (box != nullptr) box->setSelectedId (2, sendNotificationSync);
+        CHECK (q.score.numStrings == 9 && q.score.tuningName == "Drop B" && q.keyRoot == 11 && scaleAt (q.keyScale).name == "Minor");
+    }
+    PresetStore::file().deleteFile();
+}
+
 static void scaleAndTuningTests()
 {
     ScaleStore::file().deleteFile();
@@ -259,6 +347,7 @@ int main (int argc, char** argv)
     ScopedJuceInitialiser_GUI init;
     behaviourTests();
     scaleAndTuningTests();
+    chordAndPresetTests();
     gpExportAndGridTests (argc > 2 ? argv[2] : "");
     String out = argc > 1 ? argv[1] : "/tmp/snap";
     File (out).createDirectory();
@@ -275,6 +364,35 @@ int main (int argc, char** argv)
         dynamic_cast<TabMidiEditor*> (ed.get())->filesDropped (StringArray (argv[2]), 0, 0);
         click (findButton (*ed, "MAKE MIDI"));                                     // the drag area now holds every track
         snap (*ed, out + "/2_imported.png");
+    }
+    {   // 14. chord from the helper panel: info strip, chord notes bright, the rest of the key quiet
+        TabMidiProcessor p;
+        auto put = [&p] (int cell, std::initializer_list<std::pair<int, int>> notes, int len)
+        {
+            for (auto& n : notes) { p.score.cells[(size_t) cell].fret[n.first] = n.second; p.score.cells[(size_t) cell].len[n.first] = len; }
+        };
+        put (0, { { 2, 0 }, { 3, 2 }, { 4, 0 }, { 5, 0 }, { 6, 0 }, { 7, 0 } }, 8);              // open Em7
+        put (8, { { 2, 3 }, { 3, 2 }, { 4, 0 }, { 5, 0 }, { 6, 0 }, { 7, 3 } }, 8);              // G
+        std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
+        if (auto* cv = findCanvas (*ed)) cv->select (0, 4);
+        snap (*ed, out + "/15_tab_chord_info.png");
+        if (auto* pn = findPanel (*ed)) pn->pick (4, 6);                                            // Emin7 from the panel
+        snap (*ed, out + "/14_chord_info.png");
+        if (auto* pn = findPanel (*ed)) pn->pick (4, 6);
+        if (auto* cv = findCanvas (*ed)) { cv->select (16, 3); cv->putNote (3, 3); cv->putNote (4, 2); }   // two notes: a third
+        snap (*ed, out + "/17_interval_info.png");
+    }
+    {   // 16. preset dialog asking before it overwrites
+        PresetStore::file().deleteFile();
+        TabMidiProcessor p;
+        Preset snapP; snapP.tuning = p.score.tuning; snapP.tuningName = p.score.tuningName; snapP.keyRoot = p.keyRoot;
+        snapP.scaleName = scaleAt (p.keyScale).name; snapP.scaleIv = scaleAt (p.keyScale).iv; snapP.name = String::fromUTF8 ("Мой рифф-пресет");
+        { auto l = std::vector<Preset> { snapP }; PresetStore::save (l); }
+        PresetDialog d (PresetDialog::Mode::Save, snapP, {}, nullptr);
+        for (auto* ch : d.getChildren()) if (auto* te = dynamic_cast<TextEditor*> (ch)) te->setText (String::fromUTF8 ("Мой рифф-пресет"), dontSendNotification);
+        click (findButton (d, String::fromUTF8 ("Сохранить")));
+        snap (d, out + "/16_preset_dialog.png");
+        PresetStore::file().deleteFile();
     }
     {   // 13. the grid follows the note length: whole note selected
         TabMidiProcessor p;

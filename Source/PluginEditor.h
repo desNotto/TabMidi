@@ -707,7 +707,7 @@ public:
     }
 
 private:
-    struct Marker { int kind = 0; String deg; };       // kind: 0 outside, 1 root, 2 other note
+    struct Marker { int kind = 0; String deg; };       // kind: 0 outside, 1 root, 2 other note, 3 key note outside the chord (dimmed)
 
     struct Geo
     {
@@ -771,11 +771,11 @@ private:
             return;
         }
 
-        const bool isRoot = m.kind == 1;
-        g.setColour (isRoot ? col::accent : (chordMode ? col::chordTone : col::dot));
+        const bool isRoot = m.kind == 1, quiet = m.kind == 3;
+        g.setColour (quiet ? col::dot.withAlpha (0.28f) : isRoot ? col::accent : (chordMode ? col::chordTone : col::dot));
         g.fillRoundedRectangle (r, jmin (r.getWidth(), r.getHeight()) * 0.5f);
-        const Colour noteCol = isRoot ? col::bg : Colours::white;
-        const Colour degCol = isRoot ? col::bg : (chordMode ? Colour (0xffd6e6ff) : col::deg);
+        const Colour noteCol = quiet ? Colour (0xff97a3b8) : isRoot ? col::bg : Colours::white;
+        const Colour degCol = quiet ? Colour (0xff7b879c) : isRoot ? col::bg : (chordMode ? Colour (0xffd6e6ff) : col::deg);
 
         if (r.getWidth() >= 40.0f)                             // wide fret: "E 5" side by side
         {
@@ -809,6 +809,11 @@ private:
             {
                 m.kind = rel == 0 ? 1 : 2;
                 m.deg = chordDegreeLabel (rel, *chordType);
+            }
+            else                                                // a note of the key that is not in the chord stays visible, but quiet
+            {
+                const int d = degreeOf (midi, proc.keyRoot, scaleAt (proc.keyScale));
+                if (d > 0) { m.kind = 3; m.deg = String (d); }
             }
         }
         else
@@ -855,6 +860,9 @@ public:
     void setSelection (int r, int t) { selRoot = r; selType = t; repaint(); }
     void clearSelection()            { selRoot = -1; selType = -1; repaint(); }
     bool isSelected (int r, int t) const { return r == selRoot && t == selType; }
+    bool hasSelection() const { return selRoot >= 0; }
+    int selectedRoot() const { return selRoot; }
+    int selectedType() const { return selType; }
     void pick (int r, int t)         { if (onToggle) onToggle (r, t); }
 
     void paint (Graphics& g) override
@@ -1283,6 +1291,241 @@ private:
 };
 
 //==============================================================================
+/** What the strip above the fretboard shows: the chord (from the helper panel, or the selected tab column),
+    its other names, its degrees and its notes. */
+struct ChordInfo
+{
+    bool valid = false;
+    bool fromPanel = false;
+    String name, inversion;
+    std::vector<String> alt, degrees, notes;
+};
+
+class ChordInfoBar : public Component
+{
+public:
+    void setInfo (const ChordInfo& i) { info = i; repaint(); }
+
+    void paint (Graphics& g) override
+    {
+        if (! info.valid) return;
+        const float h = (float) getHeight(), width = (float) getWidth();
+        auto textW = [] (const Font& f, const String& t) { return (float) GlyphArrangement::getStringWidthInt (f, t); };
+
+        // alternative names / inversion, shown in brackets next to the name
+        String extra;
+        if (! info.alt.empty())
+        {
+            StringArray a;
+            for (auto& s : info.alt) a.add (s);
+            extra = "(" + a.joinIntoString (", ") + ")";
+        }
+        if (info.inversion.isNotEmpty()) extra += (extra.isEmpty() ? "" : "  ") + info.inversion;
+
+        const Font nameFont = fnt (17.0f, true), extraFont = fnt (12.0f), capFont = fnt (10.0f, true), capsFont = fnt (13.0f, true);
+        const float nameW = textW (nameFont, info.name) + 24.0f;
+        auto capsuleW = [&] (const String& t) { return jmax (26.0f, textW (capsFont, t) + 16.0f); };
+        auto groupW = [&] (const std::vector<String>& items, bool caption, const String& cap)
+        {
+            float w = caption ? textW (capFont, cap) + 8.0f : 0.0f;
+            for (auto& s : items) w += capsuleW (s) + 4.0f;
+            return w;
+        };
+
+        // drop the parts that do not fit, least important first: captions, then the brackets
+        bool captions = true, showExtra = extra.isNotEmpty();
+        auto total = [&] { return nameW + (showExtra ? textW (extraFont, extra) + 12.0f : 8.0f)
+                                  + 21.0f + groupW (info.degrees, captions, "СТУПЕНИ"_ru)
+                                  + 21.0f + groupW (info.notes, captions, "НОТЫ"_ru); };
+        if (total() > width) captions = false;
+        if (total() > width) showExtra = false;
+
+        float x = 0.0f;
+        const Rectangle<float> chip (x, 2.0f, nameW, h - 4.0f);
+        g.setColour (info.fromPanel ? col::chordTone : col::btnLine);
+        g.fillRoundedRectangle (chip, 8.0f);
+        g.setColour (Colours::white);
+        g.setFont (nameFont);
+        g.drawText (info.name, chip, Justification::centred, false);
+        x += nameW + 8.0f;
+
+        if (showExtra)
+        {
+            const float w = textW (extraFont, extra) + 4.0f;
+            g.setColour (col::muted);
+            g.setFont (extraFont);
+            g.drawText (extra, Rectangle<float> (x, 0.0f, w, h), Justification::centredLeft, false);
+            x += w + 4.0f;
+        }
+
+        auto divider = [&]
+        {
+            x += 8.0f;
+            g.setColour (col::btnLine);
+            g.fillRect (x, 6.0f, 1.0f, h - 12.0f);
+            x += 13.0f;
+        };
+        auto group = [&] (const std::vector<String>& items, const String& cap)
+        {
+            if (captions)
+            {
+                g.setColour (col::muted);
+                g.setFont (capFont);
+                const float w = textW (capFont, cap);
+                g.drawText (cap, Rectangle<float> (x, 0.0f, w + 2.0f, h), Justification::centredLeft, false);
+                x += w + 8.0f;
+            }
+            for (size_t i = 0; i < items.size(); ++i)
+            {
+                const float w = capsuleW (items[i]);
+                const Rectangle<float> r (x, 4.0f, w, h - 8.0f);
+                g.setColour (i == 0 ? col::accent : col::btn);
+                g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
+                g.setColour (i == 0 ? col::bg : col::text);
+                g.setFont (capsFont);
+                g.drawText (items[i], r, Justification::centred, false);
+                x += w + 4.0f;
+            }
+        };
+        divider();
+        group (info.degrees, "СТУПЕНИ"_ru);
+        divider();
+        group (info.notes, "НОТЫ"_ru);
+    }
+
+private:
+    ChordInfo info;
+};
+
+//==============================================================================
+/** Pop-up for saving, renaming and deleting presets. Overwriting an existing preset asks first. */
+class PresetDialog : public Component
+{
+public:
+    enum class Mode { Save, Rename, Delete };
+
+    /** snapshot: the setup to store (Save). oldName: the preset to rename or delete. */
+    PresetDialog (Mode m, const Preset& snapshot, const String& oldName, std::function<void()> done)
+        : mode (m), snap (snapshot), old (oldName), onDone (std::move (done))
+    {
+        nameEd.setText (m == Mode::Delete ? String() : (oldName.isNotEmpty() ? oldName : "Мой пресет"_ru), dontSendNotification);
+        nameEd.setSelectAllWhenFocused (true);
+        nameEd.onReturnKey = [this] { ok(); };
+        okBtn.onClick = [this] { ok(); };
+        cancelBtn.onClick = [this] { cancel(); };
+        okBtn.setColour (TextButton::buttonColourId, col::accent);
+        okBtn.setColour (TextButton::textColourOffId, col::bg);
+        okBtn.setButtonText (m == Mode::Delete ? "Удалить"_ru : m == Mode::Rename ? "Переименовать"_ru : "Сохранить"_ru);
+        if (m == Mode::Delete) message = "Удалить пресет «"_ru + oldName + "»?"_ru;
+        else addAndMakeVisible (nameEd);
+        addAndMakeVisible (okBtn);
+        addAndMakeVisible (cancelBtn);
+        setSize (400, m == Mode::Delete ? 120 : 160);
+    }
+
+    void paint (Graphics& g) override
+    {
+        g.fillAll (col::panel);
+        g.setColour (col::muted);
+        g.setFont (fnt (11.0f, true));
+        g.drawText (mode == Mode::Save ? "СОХРАНИТЬ ПРЕСЕТ"_ru : mode == Mode::Rename ? "ПЕРЕИМЕНОВАТЬ ПРЕСЕТ"_ru : "УДАЛИТЬ ПРЕСЕТ"_ru,
+                    14, 10, 372, 14, Justification::left, false);
+        g.setFont (fnt (13.0f, mode == Mode::Delete || overwriting));
+        g.setColour (error ? Colour (0xffff7b72) : (overwriting ? col::accent : col::text));
+        g.drawFittedText (message, 14, mode == Mode::Delete ? 34 : 70, 372, 36, Justification::topLeft, 2);
+    }
+
+    void resized() override
+    {
+        nameEd.setBounds (14, 32, getWidth() - 28, 28);
+        const int y = getHeight() - 14 - 28;
+        okBtn.setBounds (getWidth() - 14 - 150, y, 150, 28);
+        cancelBtn.setBounds (getWidth() - 14 - 150 - 8 - 90, y, 90, 28);
+    }
+
+private:
+    void close()
+    {
+        if (onDone) onDone();
+        if (auto* cb = findParentComponentOfClass<CallOutBox>()) cb->dismiss();
+    }
+
+    void cancel()
+    {
+        if (overwriting)                                          // back from the confirmation to the name
+        {
+            overwriting = false;
+            nameEd.setEnabled (true);
+            message = {};
+            okBtn.setButtonText (mode == Mode::Rename ? "Переименовать"_ru : "Сохранить"_ru);
+            cancelBtn.setButtonText ("Отмена"_ru);
+            repaint();
+            return;
+        }
+        if (auto* cb = findParentComponentOfClass<CallOutBox>()) cb->dismiss();
+    }
+
+    void ok()
+    {
+        if (mode == Mode::Delete)
+        {
+            auto list = PresetStore::load();
+            list.erase (std::remove_if (list.begin(), list.end(), [this] (const Preset& p) { return p.name == old; }), list.end());
+            PresetStore::save (list);
+            close();
+            return;
+        }
+
+        String nm = nameEd.getText().trim();
+        if (nm.isEmpty()) nm = "Мой пресет"_ru;
+        if (mode == Mode::Rename && nm == old) { if (auto* cb = findParentComponentOfClass<CallOutBox>()) cb->dismiss(); return; }
+
+        for (auto& f : factoryPresets())
+            if (f.name.equalsIgnoreCase (nm))
+            {
+                error = true;
+                message = "Это имя заводского пресета, введите другое."_ru;
+                repaint();
+                return;
+            }
+        error = false;
+
+        auto list = PresetStore::load();
+        const bool exists = std::any_of (list.begin(), list.end(), [&nm] (const Preset& p) { return p.name.equalsIgnoreCase (nm); });
+        if (exists && ! overwriting)                              // ask before replacing
+        {
+            overwriting = true;
+            nameEd.setEnabled (false);
+            message = "Пресет «"_ru + nm + "» уже есть. Перезаписать?"_ru;
+            okBtn.setButtonText ("Перезаписать"_ru);
+            cancelBtn.setButtonText ("Назад"_ru);
+            repaint();
+            return;
+        }
+
+        Preset target = snap;
+        if (mode == Mode::Rename)
+            for (auto& p : list) if (p.name == old) { target = p; break; }
+        target.name = nm;
+        target.factory = false;
+
+        list.erase (std::remove_if (list.begin(), list.end(), [&] (const Preset& p)
+                                    { return p.name.equalsIgnoreCase (nm) || (mode == Mode::Rename && p.name == old); }), list.end());
+        list.push_back (target);
+        PresetStore::save (list);
+        close();
+    }
+
+    Mode mode;
+    Preset snap;
+    String old, message;
+    bool overwriting = false, error = false;
+    std::function<void()> onDone;
+    TextEditor nameEd;
+    TextButton okBtn, cancelBtn { "Отмена"_ru };
+};
+
+//==============================================================================
 /** The "drag me into the DAW" area. Starts an OS-level drag of the generated .mid file(s). */
 class DragHandle : public Component
 {
@@ -1352,6 +1595,11 @@ private:
     void openTuningEditor (Component* from);
     void refreshAll();
     void updateTabButtons();
+    void refreshPresets();
+    void applyPreset (const Preset& p);
+    void openPresetDialog (PresetDialog::Mode mode);
+    void refreshChordInfo();
+    Preset currentSetup (const String& name) const;
     void refreshScaleBox();
     void openScaleEditor (bool editCurrent);
 
@@ -1366,6 +1614,11 @@ private:
 
     TextButton copyBtn { "Копировать"_ru }, pasteBtn { "Вставить"_ru }, delBarBtn { "Очистить"_ru }, undoBtn { "Отменить"_ru };
     ChordPanel chordPanel;
+    ChordInfoBar chordInfo;
+    ComboBox presetBox;
+    TextButton savePresetBtn { "Сохранить"_ru }, renamePresetBtn { "Переименовать"_ru }, deletePresetBtn { "Удалить"_ru };
+    Rectangle<int> rPreset;
+    String matchedUserPreset;                  // the user preset that equals the current setup, if any
     TextButton openBtn { "Открыть…"_ru }, makeBtn { "MAKE MIDI" }, saveBtn { "Сохранить…"_ru }, modeBtn { "Раздельно"_ru }, presetBtn { "Standard" };
     ComboBox trackBox, rootBox, scaleBox;
     OwnedArray<TextButton> barBtns, strBtns, chipBtns, durBtns, viewBtns;
